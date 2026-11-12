@@ -4,6 +4,7 @@ mod app;
 mod ffmpeg;
 mod model;
 mod preview;
+mod subs;
 
 use app::RunVideoApp;
 use std::path::PathBuf;
@@ -53,8 +54,10 @@ fn cli(args: &[String]) -> Option<i32> {
             println!("RunVideo {} — layered video editor\n", env!("CARGO_PKG_VERSION"));
             println!("Usage:");
             println!("  runvideo");
-            println!("  runvideo --export <project.rvproj> <output.mp4> [preset]");
+            println!("  runvideo --export <project.rvproj> <output.mp4> [preset] [profile]");
             println!("  runvideo --frame <project.rvproj> <frame.png> [time]");
+            println!("  runvideo --srt-import <project.rvproj> <in.srt> <out.rvproj>");
+            println!("  runvideo --srt-export <project.rvproj> <out.srt>");
             println!();
             println!(
                 "Presets: ultrafast | superfast | veryfast | faster | fast | medium | slow | slower | veryslow"
@@ -93,7 +96,9 @@ fn cli(args: &[String]) -> Option<i32> {
             }
             let output_path = PathBuf::from(output);
             let preset = args.get(3).map(String::as_str).unwrap_or("medium");
-            let (ff_args, duration, has_audio) = match ffmpeg::build_export_args(&project, &output_path, preset) {
+            let profile = args.get(4).map(String::as_str).unwrap_or("mp4");
+            let (ff_args, duration, has_audio) =
+                match ffmpeg::build_export_args(&project, &output_path, preset, profile) {
                 Ok(v) => v,
                 Err(e) => {
                     eprintln!("error: {e}");
@@ -159,6 +164,88 @@ fn cli(args: &[String]) -> Option<i32> {
             for (i, a) in plan.ffmpeg_args().iter().enumerate() {
                 println!("{i:>3}: {a}");
             }
+            Some(0)
+        }
+        // Subtitles: import an SRT into a project as burn-in text sections, or
+        // write every text section back out as an SRT.
+        "--srt-import" => {
+            let (Some(input), Some(srt), Some(output)) =
+                (args.get(1), args.get(2), args.get(3))
+            else {
+                eprintln!("error: --srt-import needs <project.rvproj> <in.srt> <out.rvproj>");
+                return Some(2);
+            };
+            let text = match std::fs::read_to_string(input) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("error: could not read {input}: {e}");
+                    return Some(1);
+                }
+            };
+            let mut project: model::Project =
+                match serde_json::from_str(text.trim_start_matches('\u{feff}')) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("error: invalid project: {e}");
+                        return Some(1);
+                    }
+                };
+            if let Err(e) = project.sanitize() {
+                eprintln!("error: {e}");
+                return Some(1);
+            }
+            let cues = match subs::read_srt(std::path::Path::new(srt)) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("error: could not read subtitles: {e}");
+                    return Some(1);
+                }
+            };
+            let added = subs::import_into(&mut project, 0, &cues);
+            let json = match serde_json::to_string_pretty(&project) {
+                Ok(j) => j,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    return Some(1);
+                }
+            };
+            if let Err(e) = std::fs::write(output, json) {
+                eprintln!("error: could not write {output}: {e}");
+                return Some(1);
+            }
+            println!("Imported {added} subtitle(s) into {output}");
+            Some(0)
+        }
+        "--srt-export" => {
+            let (Some(input), Some(output)) = (args.get(1), args.get(2)) else {
+                eprintln!("error: --srt-export needs <project.rvproj> <out.srt>");
+                return Some(2);
+            };
+            let text = match std::fs::read_to_string(input) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("error: could not read {input}: {e}");
+                    return Some(1);
+                }
+            };
+            let mut project: model::Project =
+                match serde_json::from_str(text.trim_start_matches('\u{feff}')) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("error: invalid project: {e}");
+                        return Some(1);
+                    }
+                };
+            if let Err(e) = project.sanitize() {
+                eprintln!("error: {e}");
+                return Some(1);
+            }
+            let cues = subs::collect_from(&project);
+            if let Err(e) = subs::save_srt(std::path::Path::new(output), &cues) {
+                eprintln!("error: {e}");
+                return Some(1);
+            }
+            println!("Wrote {} subtitle(s) to {output}", cues.len());
             Some(0)
         }
         // Render a single preview frame with the exact graph the editor uses.

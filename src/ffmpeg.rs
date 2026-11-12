@@ -4,7 +4,9 @@
 //! application tiny, avoids unsafe decoding code, and makes a crash in a decoder unable
 //! to take the editor down with it.
 
-use crate::model::{is_image_path, Clip, Keyframe, MediaKind, Project, Transform};
+use crate::model::{
+    is_image_path, Clip, Keyframe, MediaKind, Project, TextAlign, Transform, VAlign,
+};
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -194,6 +196,137 @@ pub fn thumbnail(path: &Path) -> Result<Vec<u8>> {
 }
 
 // ---------------------------------------------------------------------------
+// Audio helpers: waveform, silence detection, loudness
+// ---------------------------------------------------------------------------
+
+/// Peak-per-bucket waveform for a media file, normalised to 0..1.
+///
+/// Decoding at 2 kHz mono is tiny (8 KB per second) and plenty for a timeline
+/// drawing. `duration_hint` caps very long files.
+pub fn waveform(path: &Path, duration_hint: Option<f64>, buckets: usize) -> Result<Vec<f32>> {
+    let buckets = buckets.clamp(64, 8192);
+    let mut cmd = command("ffmpeg");
+    cmd.args(["-hide_banner", "-nostdin", "-loglevel", "error"]);
+    if let Some(d) = duration_hint {
+        let t = (d + 1.0).clamp(0.1, 3600.0);
+        cmd.args(["-t", &format!("{t:.3}")]);
+    }
+    cmd.arg("-i")
+        .arg(path)
+        .args(["-vn", "-ac", "1", "-ar", "2000", "-f", "f32le", "-"])
+        .stdin(Stdio::null());
+    let out = cmd.output().context("Could not run ffmpeg for the waveform")?;
+    if !out.status.success() || out.stdout.is_empty() {
+        bail!("waveform: no decodable audio");
+    }
+    let samples = out.stdout.len() / 4;
+    if samples == 0 {
+        bail!("waveform: no audio samples");
+    }
+    let mut peaks = vec![0f32; buckets];
+    for (i, chunk) in out.stdout.chunks_exact(4).enumerate() {
+        let v = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]).abs();
+        let bi = (i * buckets / samples).min(buckets - 1);
+        if v > peaks[bi] {
+            peaks[bi] = v;
+        }
+    }
+    let max = peaks.iter().copied().fold(0.0f32, f32::max);
+    if max > 1e-6 {
+        for p in &mut peaks {
+            *p = (*p / max).clamp(0.0, 1.0);
+        }
+    }
+    Ok(peaks)
+}
+
+/// Detect silent ranges inside `start .. start+duration` of a media file.
+/// Returned ranges are seconds relative to `start`.
+pub fn detect_silence(
+    path: &Path,
+    start: f64,
+    duration: f64,
+    noise_db: f64,
+    min_silence: f64,
+) -> Result<Vec<(f64, f64)>> {
+    let mut cmd = command("ffmpeg");
+    cmd.args(["-hide_banner", "-nostdin", "-loglevel", "info"])
+        .args(["-ss", &format!("{start:.6}")])
+        .args(["-t", &format!("{duration:.6}")])
+        .arg("-i")
+        .arg(path)
+        .args([
+            "-vn",
+            "-af",
+            &format!("silencedetect=noise={noise_db:.1}dB:d={min_silence:.3}"),
+            "-f",
+            "null",
+            "-",
+        ])
+        .stdin(Stdio::null());
+    let out = cmd.output().context("Could not run silence detection")?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        bail!("silence detection failed: {}", err.trim());
+    }
+    Ok(parse_silence(&String::from_utf8_lossy(&out.stderr), duration))
+}
+
+fn parse_silence(text: &str, duration: f64) -> Vec<(f64, f64)> {
+    let mut ranges = Vec::new();
+    let mut cur: Option<f64> = None;
+    for line in text.lines() {
+        if let Some(idx) = line.find("silence_start:") {
+            if let Some(v) = line[idx + "silence_start:".len()..]
+                .split_whitespace()
+                .next()
+                .and_then(|s| s.parse::<f64>().ok())
+            {
+                cur = Some(v.max(0.0));
+            }
+        } else if let Some(idx) = line.find("silence_end:") {
+            let v = line[idx + "silence_end:".len()..]
+                .split_whitespace()
+                .next()
+                .and_then(|s| s.parse::<f64>().ok())
+                .unwrap_or(0.0);
+            if let Some(s) = cur.take() {
+                ranges.push((s.clamp(0.0, duration), v.clamp(0.0, duration)));
+            }
+        }
+    }
+    if let Some(s) = cur {
+        ranges.push((s.clamp(0.0, duration), duration));
+    }
+    ranges
+        .into_iter()
+        .filter(|(a, b)| *b > *a + 1e-4)
+        .collect()
+}
+
+/// Render one full-resolution PNG frame at timeline time `t`.
+pub fn capture_frame(project: &Project, t: f64, out: &Path) -> Result<()> {
+    let plan = build_preview_plan(project, t, project.width, project.height)
+        .context("Nothing to capture at this position.")?;
+    let mut args = plan.ffmpeg_args();
+    args.extend([
+        "-frames:v".into(),
+        "1".into(),
+        "-y".into(),
+        out.to_string_lossy().to_string(),
+    ]);
+    let status = command("ffmpeg")
+        .args(&args)
+        .stdin(Stdio::null())
+        .status()
+        .context("Could not run ffmpeg for the frame capture")?;
+    if !status.success() {
+        bail!("frame capture failed");
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Filter graph builder
 // ---------------------------------------------------------------------------
 
@@ -208,7 +341,9 @@ struct CroppedClip {
     volume: f64,
     fade_in: f64,
     fade_out: f64,
-    speed: f64,
+    /// Average playback rate over the section (accounts for speed ramps).
+    avg_speed: f64,
+    reverse: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -375,6 +510,16 @@ fn build_graph(project: &Project, start: f64, width: u32, height: u32) -> Option
             }
 
             let speed = clip.speed.clamp(0.05, 8.0);
+            // A linear speed ramp (ignored for frozen frames).
+            let ramp = clip.speed_end.filter(|_| !clip.freeze);
+            let s_end = ramp.unwrap_or(speed).clamp(0.05, 8.0);
+            let ramp_b = ramp
+                .map(|_| (s_end - speed) / clip.duration.max(1e-9))
+                .unwrap_or(0.0);
+            // Source position (seconds into the source) after `t` timeline seconds.
+            let src_at = |t: f64| speed * t + 0.5 * ramp_b * t * t;
+            let source_off = src_at(trim_front);
+            let source_span = (src_at(clip.duration) - source_off).max(0.0);
             let is_video = clip.kind.is_video();
             let is_text = clip.is_text();
             // Only real media files take an ffmpeg input slot. A text section is
@@ -392,11 +537,22 @@ fn build_graph(project: &Project, start: f64, width: u32, height: u32) -> Option
                 // Generated title: no media input, just a transparent canvas.
             } else if is_video {
                 // `remain` is timeline time; the source consumes speed× as much.
-                let source_off = trim_front * speed;
+                // A frozen section always holds the same source frame, no matter
+                // where the playhead is inside it.
+                let seek = if clip.freeze {
+                    clip.in_point.max(0.0)
+                } else {
+                    clip.in_point + source_off
+                };
                 args.push("-ss".into());
-                args.push(fmt(clip.in_point + source_off));
+                args.push(fmt(seek));
                 args.push("-t".into());
-                args.push(fmt(remain * speed + 0.05));
+                if clip.freeze {
+                    // Only the first frame is needed; tpad holds it.
+                    args.push("0.20".into());
+                } else {
+                    args.push(fmt(source_span + 0.20));
+                }
                 args.push("-i".into());
                 args.push(clip.path.to_string_lossy().to_string());
             } else {
@@ -416,16 +572,47 @@ fn build_graph(project: &Project, start: f64, width: u32, height: u32) -> Option
                 let content = drawtext_escape(&spec.content);
                 let font = font_arg(spec.bold);
                 let color = ff_color(&spec.color);
+                // Text sizes are authored at 1080p; scale to the render size.
+                let k = (height as f64 / 1080.0).max(0.25);
+                let font_px = (spec.size * k).max(6.0);
+                let (x, y) = match (spec.align, spec.valign) {
+                    (TextAlign::Left, VAlign::Top) => ("w*0.05", "h*0.05"),
+                    (TextAlign::Left, VAlign::Middle) => ("w*0.05", "(h-text_h)/2"),
+                    (TextAlign::Left, VAlign::Bottom) => ("w*0.05", "h-text_h-h*0.05"),
+                    (TextAlign::Center, VAlign::Top) => ("(w-text_w)/2", "h*0.05"),
+                    (TextAlign::Center, VAlign::Middle) => ("(w-text_w)/2", "(h-text_h)/2"),
+                    (TextAlign::Center, VAlign::Bottom) => ("(w-text_w)/2", "h-text_h-h*0.05"),
+                    (TextAlign::Right, VAlign::Top) => ("w-text_w-w*0.05", "h*0.05"),
+                    (TextAlign::Right, VAlign::Middle) => ("w-text_w-w*0.05", "(h-text_h)/2"),
+                    (TextAlign::Right, VAlign::Bottom) => {
+                        ("w-text_w-w*0.05", "h-text_h-h*0.05")
+                    }
+                };
                 let mut dt = format!(
-                    "drawtext={font}text='{content}':fontsize={:.1}:fontcolor={color}:\
-                     x=(w-text_w)/2:y=(h-text_h)/2",
-                    spec.size * (height as f64 / 1080.0).max(0.25)
+                    "drawtext={font}text='{content}':fontsize={font_px:.1}:fontcolor={color}:\
+                     x={x}:y={y}"
                 );
                 if let Some(bg) = &spec.background {
                     dt.push_str(&format!(
                         ":box=1:boxcolor={}@0.55:boxborderw={:.0}",
                         ff_color(bg),
-                        (spec.size * 0.22).max(6.0)
+                        (font_px * 0.22).max(6.0)
+                    ));
+                }
+                let outline = (spec.outline * k).max(0.0);
+                if outline > 0.01 {
+                    dt.push_str(&format!(
+                        ":borderw={:.1}:bordercolor={}",
+                        outline,
+                        ff_color(&spec.outline_color)
+                    ));
+                }
+                let shadow = (spec.shadow * k).max(0.0);
+                if shadow > 0.01 {
+                    let off = (shadow * 0.35).max(1.0);
+                    dt.push_str(&format!(
+                        ":shadowx={off:.1}:shadowy={off:.1}:shadowcolor={}@0.75",
+                        ff_color(&spec.shadow_color)
                     ));
                 }
                 filters.push(format!(
@@ -435,7 +622,36 @@ fn build_graph(project: &Project, start: f64, width: u32, height: u32) -> Option
             } else {
                 // Speed change before fps conversion so the output keeps the
                 // project frame rate.
-                let speed_filter = if (speed - 1.0).abs() > 1e-6 {
+                let speed_filter = if clip.freeze {
+                    // Hold the first frame of the window for the whole section.
+                    format!(
+                        "trim=end_frame=1,setpts=PTS-STARTPTS,\
+                         tpad=stop_mode=clone:stop_duration={},",
+                        fmt(remain)
+                    )
+                } else if clip.reverse {
+                    if (speed - 1.0).abs() > 1e-6 {
+                        format!("reverse,setpts=(PTS-STARTPTS)/{speed:.6},")
+                    } else {
+                        "reverse,setpts=PTS-STARTPTS,".to_owned()
+                    }
+                } else if ramp.is_some() {
+                    // The input window starts at `source_off`, so T is the source
+                    // time elapsed inside the window. Solve s0*t + b*t^2/2 = T
+                    // for the output time t.
+                    let s_at = speed + ramp_b * trim_front;
+                    let out = if ramp_b.abs() < 1e-9 {
+                        format!("(T/{s_at:.6})")
+                    } else {
+                        format!(
+                            "((-{s_at:.6}+sqrt({s2:.6}+{b2:.6}*T))/{b:.6})",
+                            s2 = s_at * s_at,
+                            b2 = 2.0 * ramp_b,
+                            b = ramp_b
+                        )
+                    };
+                    format!("setpts=PTS-STARTPTS,setpts=({out})/TB,")
+                } else if (speed - 1.0).abs() > 1e-6 {
                     format!("setpts=(PTS-STARTPTS)/{speed:.6},")
                 } else {
                     "setpts=PTS-STARTPTS,".to_owned()
@@ -691,7 +907,7 @@ fn build_graph(project: &Project, start: f64, width: u32, height: u32) -> Option
                 input: idx,
                 duration: remain,
                 offset: (clip_start - start).max(0.0),
-                has_audio: is_video && clip.has_audio,
+                has_audio: is_video && clip.has_audio && !clip.freeze,
                 is_video,
                 volume: clip.volume,
                 // Audio also begins at `trim_front` into the section (the input
@@ -699,7 +915,8 @@ fn build_graph(project: &Project, start: f64, width: u32, height: u32) -> Option
                 // resume rather than restart.
                 fade_in: fade_in_left,
                 fade_out,
-                speed,
+                avg_speed: clip.avg_speed(),
+                reverse: clip.reverse && !clip.freeze,
             });
         }
 
@@ -870,7 +1087,11 @@ fn atempo_chain(speed: f64) -> String {
     }
 }
 
-fn build_audio_filters(graph: &BuiltGraph, duration: f64) -> Option<(Vec<String>, String)> {
+fn build_audio_filters(
+    graph: &BuiltGraph,
+    duration: f64,
+    normalize: bool,
+) -> Option<(Vec<String>, String)> {
     let any_audio = graph
         .layers
         .iter()
@@ -892,17 +1113,19 @@ fn build_audio_filters(graph: &BuiltGraph, duration: f64) -> Option<(Vec<String>
             let label = format!("a{}_{}", layer.index, si);
             if clip.is_video && clip.has_audio {
                 // Speed changes pitch-shift via atempo; the source is consumed at
-                // `speed`× the timeline rate. A single atempo only accepts
-                // 0.5–2.0, so larger/smaller factors are chained.
-                let tempo = atempo_chain(clip.speed);
+                // `avg_speed`× the timeline rate. A single atempo only accepts
+                // 0.5–2.0, so larger/smaller factors are chained. Reversed
+                // sections are reversed before the speed change.
+                let tempo = atempo_chain(clip.avg_speed);
+                let reverse = if clip.reverse { "areverse," } else { "" };
                 // Trim to the timeline duration after the speed change, so the
                 // audio segment matches its video segment exactly.
                 filters.push(format!(
-                    "[{}:a]atrim=start=0:end={},asetpts=PTS-STARTPTS,{tempo}aresample=48000,\
+                    "[{}:a]atrim=start=0:end={},asetpts=PTS-STARTPTS,{reverse}{tempo}aresample=48000,\
                      aformat=sample_fmts=fltp:channel_layouts=stereo,\
                      atrim=start=0:end={},asetpts=PTS-STARTPTS[{}]",
                     clip.input,
-                    fmt(clip.duration * clip.speed + 0.05),
+                    fmt(clip.duration * clip.avg_speed + 0.05),
                     fmt(clip.duration),
                     label
                 ));
@@ -969,11 +1192,21 @@ fn build_audio_filters(graph: &BuiltGraph, duration: f64) -> Option<(Vec<String>
         return None;
     }
     let final_label = "aout".to_owned();
+    // Loudness normalisation runs before the limiter so boosted peaks still
+    // cannot clip. `aresample` undoes loudnorm's internal 192 kHz rate.
+    let mastering = if normalize {
+        "loudnorm=I=-16:TP=-1.5:LRA=11,aresample=48000,"
+    } else {
+        ""
+    };
     if padded.len() == 1 {
-        filters.push(format!("{}alimiter=limit=0.95[{}]", padded[0], final_label));
+        filters.push(format!(
+            "{}{mastering}alimiter=limit=0.95[{}]",
+            padded[0], final_label
+        ));
     } else {
         filters.push(format!(
-            "{}amix=inputs={}:duration=longest:normalize=0,alimiter=limit=0.95[{}]",
+            "{}amix=inputs={}:duration=longest:normalize=0,{mastering}alimiter=limit=0.95[{}]",
             padded.join(""),
             padded.len(),
             final_label
@@ -982,11 +1215,46 @@ fn build_audio_filters(graph: &BuiltGraph, duration: f64) -> Option<(Vec<String>
     Some((filters, final_label))
 }
 
+/// User-facing export profiles: `(label, id)`.
+pub const EXPORT_PROFILES: &[(&str, &str)] = &[
+    ("MP4 - project size", "mp4"),
+    ("MP4 1080p", "mp4_1080"),
+    ("MP4 720p (small file)", "mp4_720"),
+    ("Vertical 1080x1920", "vertical"),
+    ("Square 1080x1080", "square"),
+    ("GIF 480 px", "gif"),
+    ("Audio only (M4A)", "audio"),
+];
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProfileKind {
+    Mp4 { width: u32, height: u32, crf: u32 },
+    Gif { width: u32 },
+    Audio,
+}
+
+fn profile_kind(project: &Project, profile: &str) -> ProfileKind {
+    match profile {
+        "mp4_1080" => ProfileKind::Mp4 { width: 1920, height: 1080, crf: 20 },
+        "mp4_720" => ProfileKind::Mp4 { width: 1280, height: 720, crf: 22 },
+        "vertical" => ProfileKind::Mp4 { width: 1080, height: 1920, crf: 20 },
+        "square" => ProfileKind::Mp4 { width: 1080, height: 1080, crf: 20 },
+        "gif" => ProfileKind::Gif { width: 480 },
+        "audio" => ProfileKind::Audio,
+        _ => ProfileKind::Mp4 {
+            width: project.width,
+            height: project.height,
+            crf: 20,
+        },
+    }
+}
+
 /// Full export command arguments (excluding -progress). Returns (args, duration, has_audio).
 pub fn build_export_args(
     project: &Project,
     output: &Path,
     preset: &str,
+    profile: &str,
 ) -> Result<(Vec<String>, f64, bool)> {
     const VALID_PRESETS: [&str; 9] = [
         "ultrafast",
@@ -1004,7 +1272,20 @@ pub fn build_export_args(
     } else {
         "medium"
     };
-    let mut graph = build_graph(project, 0.0, project.width, project.height)
+    let kind = profile_kind(project, profile);
+    let (out_w, out_h) = match kind {
+        ProfileKind::Mp4 { width, height, .. } => (even(width), even(height)),
+        ProfileKind::Gif { width } => {
+            let w = even(width);
+            let h = even((width as f64 * project.height as f64
+                / project.width.max(1) as f64)
+                .round()
+                .max(2.0) as u32);
+            (w, h)
+        }
+        ProfileKind::Audio => (project.width, project.height),
+    };
+    let mut graph = build_graph(project, 0.0, out_w, out_h)
         .context("The timeline is empty; add media before exporting.")?;
     let duration = graph.duration;
     // Keep a slice of the machine free so the UI stays responsive and the
@@ -1028,47 +1309,117 @@ pub fn build_export_args(
     ];
     args.extend(graph.args.clone());
 
-    let audio = build_audio_filters(&graph, duration);
+    let audio = build_audio_filters(&graph, duration, project.normalize_audio);
     if let Some((audio_filters, _)) = &audio {
         graph.filters.extend(audio_filters.iter().cloned());
     }
+
+    // GIF needs a palette pass over the final RGBA frame.
+    let mut video_label = graph.final_video.clone();
+    if let ProfileKind::Gif { .. } = kind {
+        graph.filters.push(format!(
+            "[{video_label}]format=rgb24,split[gif_a][gif_b]"
+        ));
+        graph.filters
+            .push("[gif_a]palettegen=stats_mode=diff[gif_p]".to_owned());
+        graph.filters.push(
+            "[gif_b][gif_p]paletteuse=dither=bayer:bayer_scale=3[gif_out]".to_owned(),
+        );
+        video_label = "gif_out".to_owned();
+    }
+
+    // Audio-only exports still build the full video graph. Consume its output
+    // with a sink so FFmpeg does not reject the unconnected filter pad.
+    if let ProfileKind::Audio = kind {
+        graph.filters.push(format!("[{video_label}]nullsink"));
+    }
+
     args.push("-filter_complex".into());
     args.push(graph.filters.join(";"));
-    args.push("-map".into());
-    args.push(format!("[{}]", graph.final_video));
-    let has_audio = if let Some((_, label)) = &audio {
-        args.push("-map".into());
-        args.push(format!("[{label}]"));
-        args.push("-c:a".into());
-        args.push("aac".into());
-        args.push("-b:a".into());
-        args.push("192k".into());
-        true
+    let mut has_audio = false;
+    if let ProfileKind::Audio = kind {
+        // Ignore the video stream entirely.
+        if let Some((_, label)) = &audio {
+            args.push("-map".into());
+            args.push(format!("[{label}]"));
+            has_audio = true;
+        }
     } else {
-        args.push("-an".into());
-        false
-    };
-    args.extend([
-        "-t".to_owned(),
-        fmt(duration),
-        "-r".to_owned(),
-        project.fps.to_string(),
-        "-c:v".to_owned(),
-        "libx264".to_owned(),
-        "-threads".to_owned(),
-        encoder_threads.to_string(),
-        "-preset".to_owned(),
-        preset.to_owned(),
-        "-crf".to_owned(),
-        "20".to_owned(),
-        "-pix_fmt".to_owned(),
-        "yuv420p".to_owned(),
-        // No `+faststart`: it rewrites the whole file a second time at the end,
-        // which doubles disk churn and makes the export look frozen at ~99%.
-        "-progress".to_owned(),
-        "pipe:1".to_owned(),
-        "-nostats".to_owned(),
-    ]);
+        args.push("-map".into());
+        args.push(format!("[{video_label}]"));
+        if let ProfileKind::Gif { .. } = kind {
+            args.push("-an".into());
+        } else if let Some((_, label)) = &audio {
+            args.push("-map".into());
+            args.push(format!("[{label}]"));
+            args.push("-c:a".into());
+            args.push("aac".into());
+            args.push("-b:a".into());
+            args.push("192k".into());
+            has_audio = true;
+        } else {
+            args.push("-an".into());
+        }
+    }
+
+    match kind {
+        ProfileKind::Audio => {
+            if !has_audio {
+                bail!("This timeline has no audio to export.");
+            }
+            args.extend([
+                "-t".to_owned(),
+                fmt(duration),
+                "-vn".to_owned(),
+                "-c:a".to_owned(),
+                "aac".to_owned(),
+                "-b:a".to_owned(),
+                "192k".to_owned(),
+                "-progress".to_owned(),
+                "pipe:1".to_owned(),
+                "-nostats".to_owned(),
+            ]);
+        }
+        ProfileKind::Gif { .. } => {
+            args.extend([
+                "-t".to_owned(),
+                fmt(duration),
+                "-r".to_owned(),
+                "15".to_owned(),
+                "-c:v".to_owned(),
+                "gif".to_owned(),
+                "-loop".to_owned(),
+                "0".to_owned(),
+                "-progress".to_owned(),
+                "pipe:1".to_owned(),
+                "-nostats".to_owned(),
+            ]);
+        }
+        ProfileKind::Mp4 { crf, .. } => {
+            args.extend([
+                "-t".to_owned(),
+                fmt(duration),
+                "-r".to_owned(),
+                project.fps.to_string(),
+                "-c:v".to_owned(),
+                "libx264".to_owned(),
+                "-threads".to_owned(),
+                encoder_threads.to_string(),
+                "-preset".to_owned(),
+                preset.to_owned(),
+                "-crf".to_owned(),
+                crf.to_string(),
+                "-pix_fmt".to_owned(),
+                "yuv420p".to_owned(),
+                // No `+faststart`: it rewrites the whole file a second time at the
+                // end, which doubles disk churn and makes the export look frozen
+                // at ~99%.
+                "-progress".to_owned(),
+                "pipe:1".to_owned(),
+                "-nostats".to_owned(),
+            ]);
+        }
+    }
     args.push(output.to_string_lossy().to_string());
     Ok((args, duration, has_audio))
 }
@@ -1084,13 +1435,14 @@ pub fn run_export(
     project: Project,
     output: PathBuf,
     preset: String,
+    profile: String,
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     tx: std::sync::mpsc::Sender<ExportMsg>,
 ) {
     use std::io::{BufRead, BufReader};
     use std::sync::atomic::Ordering;
 
-    let (args, duration) = match build_export_args(&project, &output, &preset) {
+    let (args, duration) = match build_export_args(&project, &output, &preset, &profile) {
         Ok(v) => (v.0, v.1),
         Err(e) => {
             let _ = tx.send(ExportMsg::Done(Err(e.to_string())));
@@ -1228,7 +1580,7 @@ mod tests {
     fn export_args_limit_resource_use() {
         let p = project_with_crop();
         let (args, duration, has_audio) =
-            build_export_args(&p, Path::new("out.mp4"), "ultrafast").unwrap();
+            build_export_args(&p, Path::new("out.mp4"), "ultrafast", "mp4").unwrap();
         assert!((duration - 2.0).abs() < 1e-6);
         assert!(has_audio);
         assert!(args.iter().any(|a| a == "-filter_complex_threads"));
@@ -1294,7 +1646,7 @@ mod tests {
         assert!(joined.contains("+5.000000/TB"), "{joined}");
 
         // Audio follows the same placement.
-        let (audio, _) = build_audio_filters(&graph, graph.duration).expect("audio");
+        let (audio, _) = build_audio_filters(&graph, graph.duration, false).expect("audio");
         let ajoined = audio.join(";");
         assert!(ajoined.contains("adelay=5000|5000"), "{ajoined}");
     }
@@ -1317,5 +1669,170 @@ mod tests {
         let graph = build_graph(&p, 0.0, p.width, p.height).expect("graph");
         assert_eq!(graph.layers.len(), 1);
         assert!(!graph.final_video.is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // Feature coverage: speed ramp / reverse / freeze, text styling,
+    // export profiles, loudness, silence parsing.
+    // ------------------------------------------------------------------
+
+    fn single_video_project(mutate: impl Fn(&mut Clip)) -> Project {
+        let mut p = Project::new();
+        p.width = 640;
+        p.height = 360;
+        p.fps = 30;
+        let mut c = Clip {
+            id: 1,
+            path: PathBuf::from("does-not-exist.mp4"),
+            name: "clip".to_owned(),
+            kind: MediaKind::Video,
+            duration: 4.0,
+            source_duration: Some(10.0),
+            has_audio: true,
+            ..Clip::default()
+        };
+        mutate(&mut c);
+        p.layers[0].clips.push(c);
+        p
+    }
+
+    #[test]
+    fn freeze_holds_one_frame_without_audio() {
+        let p = single_video_project(|c| c.freeze = true);
+        let graph = build_graph(&p, 1.0, p.width, p.height).unwrap();
+        let joined = graph.filters.join(";");
+        assert!(joined.contains("tpad=stop_mode=clone"), "{joined}");
+        let audio = build_audio_filters(&graph, graph.duration, false);
+        assert!(audio.is_none(), "frozen sections must not contribute audio");
+    }
+
+    #[test]
+    fn reverse_uses_reverse_filters_and_areverse() {
+        let p = single_video_project(|c| c.reverse = true);
+        let graph = build_graph(&p, 0.0, p.width, p.height).unwrap();
+        let joined = graph.filters.join(";");
+        assert!(joined.starts_with("[0:v]reverse"), "{joined}");
+        let (audio, _) = build_audio_filters(&graph, graph.duration, false).expect("audio");
+        assert!(audio.join(";").contains("areverse"), "{audio:?}");
+    }
+
+    #[test]
+    fn speed_ramp_uses_a_timestamp_expression() {
+        let p = single_video_project(|c| {
+            c.speed = 0.5;
+            c.speed_end = Some(2.0);
+        });
+        let graph = build_graph(&p, 0.0, p.width, p.height).unwrap();
+        let joined = graph.filters.join(";");
+        assert!(joined.contains("sqrt("), "{joined}");
+        // The expression must not smuggle an option separator into the filter.
+        let expr = joined.split("setpts=(").nth(1).unwrap_or("");
+        let expr = expr.split(")/TB").next().unwrap_or("");
+        assert!(!expr.contains(','), "expression leaked a comma: {expr}");
+    }
+
+    #[test]
+    fn text_style_emits_outline_shadow_and_alignment() {
+        let mut p = Project::new();
+        p.width = 640;
+        p.height = 360;
+        let mut spec = crate::model::TextSpec::new("Hello");
+        spec.outline = 4.0;
+        spec.shadow = 6.0;
+        spec.align = TextAlign::Right;
+        spec.valign = VAlign::Bottom;
+        p.layers[0].clips.push(Clip {
+            id: 1,
+            name: "title".to_owned(),
+            kind: MediaKind::Text,
+            duration: 2.0,
+            text: Some(spec),
+            ..Clip::default()
+        });
+        let graph = build_graph(&p, 0.0, p.width, p.height).unwrap();
+        let joined = graph.filters.join(";");
+        assert!(joined.contains("borderw="), "{joined}");
+        assert!(joined.contains("shadowx="), "{joined}");
+        assert!(joined.contains("w-text_w-w*0.05"), "{joined}");
+        assert!(joined.contains("h-text_h-h*0.05"), "{joined}");
+    }
+
+    #[test]
+    fn audio_profile_maps_only_audio_and_sinks_video() {
+        let p = single_video_project(|_| {});
+        let (args, _, has_audio) =
+            build_export_args(&p, Path::new("out.m4a"), "ultrafast", "audio").unwrap();
+        assert!(has_audio);
+        assert!(args.iter().any(|a| a == "-vn"));
+        let graph = args.iter().position(|a| a == "-filter_complex").unwrap() + 1;
+        assert!(args[graph].contains("nullsink"), "{}", args[graph]);
+        assert!(!args.iter().any(|a| a == "[vout]"));
+    }
+
+    #[test]
+    fn gif_and_social_profiles_change_the_output_geometry() {
+        let p = single_video_project(|_| {});
+        let (args, _, _) = build_export_args(&p, Path::new("out.mp4"), "ultrafast", "vertical").unwrap();
+        let graph = args.iter().position(|a| a == "-filter_complex").unwrap() + 1;
+        assert!(args[graph].contains("s=1080x1920"), "{}", args[graph]);
+
+        let (args, _, _) = build_export_args(&p, Path::new("out.mp4"), "ultrafast", "square").unwrap();
+        let graph = args.iter().position(|a| a == "-filter_complex").unwrap() + 1;
+        assert!(args[graph].contains("s=1080x1080"), "{}", args[graph]);
+
+        let (args, _, _) =
+            build_export_args(&p, Path::new("out.gif"), "ultrafast", "gif").unwrap();
+        let graph = args.iter().position(|a| a == "-filter_complex").unwrap() + 1;
+        assert!(args[graph].contains("palettegen"), "{}", args[graph]);
+        assert!(args.iter().any(|a| a == "gif"));
+        assert!(args.iter().any(|a| a == "-an"));
+    }
+
+    #[test]
+    fn loudness_normalisation_is_optional() {
+        let mut p = single_video_project(|_| {});
+        p.normalize_audio = true;
+        let (args, _, _) =
+            build_export_args(&p, Path::new("out.mp4"), "ultrafast", "mp4").unwrap();
+        let graph = args.iter().position(|a| a == "-filter_complex").unwrap() + 1;
+        assert!(args[graph].contains("loudnorm=I=-16"), "{}", args[graph]);
+
+        p.normalize_audio = false;
+        let (args, _, _) =
+            build_export_args(&p, Path::new("out.mp4"), "ultrafast", "mp4").unwrap();
+        let graph = args.iter().position(|a| a == "-filter_complex").unwrap() + 1;
+        assert!(!args[graph].contains("loudnorm"), "{}", args[graph]);
+    }
+
+    #[test]
+    fn silence_ranges_are_parsed_from_ffmpeg_logs() {
+        let log = "[silencedetect @ 0000] silence_start: 1.25\n\
+                   [silencedetect @ 0000] silence_end: 3.5 | silence_duration: 2.25\n\
+                   [silencedetect @ 0000] silence_start: 7\n";
+        let ranges = parse_silence(log, 10.0);
+        assert_eq!(ranges.len(), 2);
+        assert!((ranges[0].0 - 1.25).abs() < 1e-6);
+        assert!((ranges[0].1 - 3.5).abs() < 1e-6);
+        // An unterminated final range extends to the end of the section.
+        assert!((ranges[1].0 - 7.0).abs() < 1e-6);
+        assert!((ranges[1].1 - 10.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn waveform_and_silence_work_on_the_sample_media() {
+        let base = Path::new("sample/base.mp4");
+        if !base.exists() {
+            return;
+        }
+        let peaks = waveform(base, Some(6.0), 200).expect("waveform");
+        assert_eq!(peaks.len(), 200);
+        assert!(peaks.iter().all(|p| (0.0..=1.0).contains(p)));
+        assert!(peaks.iter().any(|p| *p > 0.05), "waveform is flat: {peaks:?}");
+        // The detector must run end-to-end even when it finds nothing.
+        let ranges = detect_silence(base, 0.0, 4.0, -35.0, 0.3).expect("silence detection");
+        for (a, b) in ranges {
+            assert!(b > a);
+            assert!(b <= 4.001);
+        }
     }
 }

@@ -75,6 +75,16 @@ pub struct Clip {
     /// Playback speed of the section. 1.0 = normal, 0.5 = half speed.
     #[serde(default = "default_gain")]
     pub speed: f64,
+    /// Optional end speed for a speed ramp. When set, the section starts at
+    /// `speed` and reaches this rate at its end (linear ramp).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speed_end: Option<f64>,
+    /// Play the section backwards.
+    #[serde(default)]
+    pub reverse: bool,
+    /// Hold one frame (taken at `in_point`) for the whole section.
+    #[serde(default)]
+    pub freeze: bool,
     /// Text content when `kind` is [`MediaKind::Text`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<TextSpec>,
@@ -143,6 +153,9 @@ impl Default for Clip {
             fade_in: 0.0,
             fade_out: 0.0,
             speed: 1.0,
+            speed_end: None,
+            reverse: false,
+            freeze: false,
             text: None,
             brightness: 0.0,
             contrast: 1.0,
@@ -171,6 +184,24 @@ pub struct Keyframe {
     pub transform: Transform,
 }
 
+/// Horizontal alignment of a text section inside the output frame.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TextAlign {
+    Left,
+    #[default]
+    Center,
+    Right,
+}
+
+/// Vertical alignment of a text section inside the output frame.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VAlign {
+    Top,
+    #[default]
+    Middle,
+    Bottom,
+}
+
 /// Styling for a text section.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TextSpec {
@@ -185,6 +216,30 @@ pub struct TextSpec {
     pub background: Option<String>,
     #[serde(default)]
     pub bold: bool,
+    /// Outline thickness in pixels at 1080p (0 = no outline).
+    #[serde(default)]
+    pub outline: f64,
+    /// `#rrggbb` outline colour.
+    #[serde(default = "default_outline_color")]
+    pub outline_color: String,
+    /// Drop-shadow offset in pixels at 1080p (0 = no shadow).
+    #[serde(default)]
+    pub shadow: f64,
+    /// `#rrggbb` drop-shadow colour.
+    #[serde(default = "default_shadow_color")]
+    pub shadow_color: String,
+    #[serde(default)]
+    pub align: TextAlign,
+    #[serde(default)]
+    pub valign: VAlign,
+}
+
+fn default_outline_color() -> String {
+    "#000000".to_owned()
+}
+
+fn default_shadow_color() -> String {
+    "#000000".to_owned()
 }
 
 fn default_font_size() -> f64 {
@@ -203,6 +258,12 @@ impl TextSpec {
             color: default_text_color(),
             background: None,
             bold: false,
+            outline: 0.0,
+            outline_color: default_outline_color(),
+            shadow: 0.0,
+            shadow_color: default_shadow_color(),
+            align: TextAlign::Center,
+            valign: VAlign::Middle,
         }
     }
 }
@@ -234,9 +295,19 @@ impl Clip {
         self.transform
     }
 
-    /// Seconds of source media this section consumes (accounts for speed).
+    /// Seconds of source media this section consumes (accounts for speed and
+    /// for a linear speed ramp).
     pub fn source_span(&self) -> f64 {
-        self.duration * self.speed.clamp(0.05, 8.0)
+        let s0 = self.speed.clamp(0.05, 8.0);
+        let s1 = self.speed_end.unwrap_or(s0).clamp(0.05, 8.0);
+        self.duration * (s0 + s1) * 0.5
+    }
+
+    /// Average playback rate over the section (used for trims).
+    pub fn avg_speed(&self) -> f64 {
+        let s0 = self.speed.clamp(0.05, 8.0);
+        let s1 = self.speed_end.unwrap_or(s0).clamp(0.05, 8.0);
+        (s0 + s1) * 0.5
     }
 
     #[allow(dead_code)]
@@ -376,6 +447,9 @@ pub struct Project {
     /// speed is multiplied by this value when the whole project is retimed.
     #[serde(default = "default_speed")]
     pub speed: f64,
+    /// Apply EBU R128 loudness normalisation to the final mix on export.
+    #[serde(default)]
+    pub normalize_audio: bool,
     #[serde(skip)]
     pub path: Option<PathBuf>,
 }
@@ -409,6 +483,7 @@ impl Project {
             start_marker: None,
             markers: Vec::new(),
             speed: 1.0,
+            normalize_audio: false,
             path: None,
         }
     }
@@ -535,7 +610,7 @@ impl Project {
     /// source material and the minimum clip length.
     pub fn trim_left(&mut self, id: u64, delta: f64, min: f64) -> Option<f64> {
         let (li, ci) = self.find_clip(id)?;
-        let speed = self.layers[li].clips[ci].speed.clamp(0.05, 8.0);
+        let speed = self.layers[li].clips[ci].avg_speed();
         let (duration, in_point, kind) = {
             let c = &self.layers[li].clips[ci];
             (c.duration, c.in_point, c.kind)
@@ -577,12 +652,11 @@ impl Project {
             (
                 c.duration,
                 c.in_point,
-                c.speed.clamp(0.05, 8.0),
+                c.avg_speed(),
                 c.source_duration,
                 c.kind,
             )
-        };
-        let max_dur = if kind.is_video() {
+        };        let max_dur = if kind.is_video() {
             source
                 .map(|sd| ((sd - in_point) / speed).max(min))
                 .unwrap_or(3600.0)
@@ -788,6 +862,119 @@ impl Project {
         true
     }
 
+    /// Remove gaps on `layer`, packing its sections back-to-back in start order.
+    /// Returns how many sections moved.
+    pub fn close_gaps(&mut self, layer: usize) -> usize {
+        let Some(l) = self.layers.get_mut(layer) else {
+            return 0;
+        };
+        let mut order: Vec<usize> = (0..l.clips.len()).collect();
+        order.sort_by(|a, b| {
+            l.clips[*a]
+                .start
+                .partial_cmp(&l.clips[*b].start)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let mut cursor = 0.0;
+        let mut moved = 0;
+        for i in order {
+            let c = &mut l.clips[i];
+            if (c.start - cursor).abs() > 1e-6 {
+                moved += 1;
+            }
+            c.start = cursor.max(0.0);
+            cursor += c.duration;
+        }
+        moved
+    }
+
+    /// Delete several sections and shift later sections on the same layer left
+    /// to close the holes they leave (ripple delete). Returns removed count.
+    pub fn ripple_delete(&mut self, ids: &[u64]) -> usize {
+        let mut removed = 0;
+        for layer in &mut self.layers {
+            let mut holes: Vec<(f64, f64)> = Vec::new();
+            layer.clips.retain(|c| {
+                if ids.contains(&c.id) {
+                    holes.push((c.start.max(0.0), c.duration));
+                    false
+                } else {
+                    true
+                }
+            });
+            if holes.is_empty() {
+                continue;
+            }
+            removed += holes.len();
+            for c in &mut layer.clips {
+                let start = c.start.max(0.0);
+                let shift: f64 = holes
+                    .iter()
+                    .filter(|(hs, hd)| hs + hd <= start + 1e-6)
+                    .map(|(_, hd)| *hd)
+                    .sum();
+                c.start = (start - shift).max(0.0);
+            }
+        }
+        removed
+    }
+
+    /// Replace `id` with the given timeline-local `keep` ranges (silence removal).
+    /// Returns how many sections the original was split into.
+    pub fn cut_silence(&mut self, id: u64, keep: &[(f64, f64)]) -> Result<usize, String> {
+        let (li, ci) = self
+            .find_clip(id)
+            .ok_or_else(|| "That section no longer exists.".to_owned())?;
+        let base = self.layers[li].clips[ci].clone();
+        let extra = keep.len().saturating_sub(1);
+        if self.total_clips() + extra > MAX_CLIPS {
+            return Err(format!(
+                "Section limit reached: a project can contain at most {MAX_CLIPS} sections."
+            ));
+        }
+        let speed = base.avg_speed();
+        let mut pieces: Vec<Clip> = Vec::new();
+        for (i, (s, e)) in keep.iter().enumerate() {
+            let s = s.clamp(0.0, base.duration);
+            let e = e.clamp(0.0, base.duration);
+            if e - s < MIN_CLIP {
+                continue;
+            }
+            let mut c = base.clone();
+            if i > 0 {
+                c.id = self.alloc_id();
+            }
+            c.start = base.start.max(0.0) + s;
+            c.duration = e - s;
+            if base.kind.is_video() {
+                c.in_point = base.in_point + s * speed;
+            }
+            c.fade_in = c.fade_in.min(c.duration);
+            c.fade_out = c.fade_out.min(c.duration);
+            if !base.keyframes.is_empty() {
+                c.keyframes = base
+                    .keyframes
+                    .iter()
+                    .filter(|k| k.time >= s && k.time <= e)
+                    .map(|k| Keyframe {
+                        time: k.time - s,
+                        transform: k.transform,
+                    })
+                    .collect();
+            }
+            pieces.push(c);
+        }
+        if pieces.is_empty() {
+            return Err("The section is entirely silent.".to_owned());
+        }
+        let n = pieces.len();
+        self.layers[li].clips.remove(ci);
+        for (k, p) in pieces.into_iter().enumerate() {
+            self.layers[li].clips.insert(ci + k, p);
+        }
+        Ok(n)
+    }
+
     pub fn sanitize(&mut self) -> Result<(), String> {
         if self.layers.is_empty() {
             self.layers.push(Layer {
@@ -844,6 +1031,19 @@ impl Project {
                 clip.transform.scale = clip.transform.scale.clamp(0.02, 4.0);
                 clip.transform.opacity = clip.transform.opacity.clamp(0.0, 1.0);
                 clip.speed = clip.speed.clamp(0.05, 8.0);
+                clip.speed_end = clip.speed_end.map(|s| s.clamp(0.05, 8.0));
+                if clip
+                    .speed_end
+                    .map(|s| (s - clip.speed).abs() < 1e-4)
+                    .unwrap_or(false)
+                {
+                    clip.speed_end = None;
+                }
+                if clip.freeze {
+                    // A held frame has no motion to reverse or ramp.
+                    clip.reverse = false;
+                    clip.speed_end = None;
+                }
                 clip.volume = clip.volume.clamp(0.0, 4.0);
                 clip.brightness = clip.brightness.clamp(-1.0, 1.0);
                 clip.contrast = clip.contrast.clamp(0.0, 3.0);
@@ -897,6 +1097,8 @@ impl Project {
                 }
                 if let Some(text) = &mut clip.text {
                     text.size = text.size.clamp(8.0, 400.0);
+                    text.outline = text.outline.clamp(0.0, 80.0);
+                    text.shadow = text.shadow.clamp(0.0, 80.0);
                 }
                 max_id = max_id.max(clip.id);
             }
@@ -1479,6 +1681,59 @@ mod tests {
         let mut back: Project = serde_json::from_str(&json).unwrap();
         back.sanitize().unwrap();
         assert_eq!(back.layers[0].clips[0].transform, Transform::webcam_default());
+    }
+
+    #[test]
+    fn close_gaps_packs_sections_back_to_back() {
+        let mut p = Project::new();
+        let mut a = clip(1, 2.0);
+        a.start = 0.0;
+        let mut b = clip(2, 3.0);
+        b.start = 5.0;
+        let mut c = clip(3, 1.0);
+        c.start = 12.0;
+        p.layers[0].clips = vec![c, a, b];
+        assert_eq!(p.close_gaps(0), 2);
+        let mut starts: Vec<f64> = p.layers[0].clips.iter().map(|c| c.start).collect();
+        starts.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        assert_eq!(starts, vec![0.0, 2.0, 5.0]);
+    }
+
+    #[test]
+    fn ripple_delete_closes_the_holes() {
+        let mut p = Project::new();
+        for (i, start) in [(1u64, 0.0), (2, 2.0), (3, 4.0), (4, 6.0)] {
+            let mut c = clip(i, 2.0);
+            c.start = start;
+            p.layers[0].clips.push(c);
+        }
+        assert_eq!(p.ripple_delete(&[2, 3]), 2);
+        let starts: Vec<f64> = p.layers[0].clips.iter().map(|c| c.start).collect();
+        assert_eq!(starts, vec![0.0, 2.0]);
+        assert_eq!(p.layers[0].clips[1].id, 4);
+    }
+
+    #[test]
+    fn speed_ramp_averages_source_consumption() {
+        let mut c = clip(1, 4.0);
+        c.speed = 1.0;
+        c.speed_end = Some(3.0);
+        assert!((c.avg_speed() - 2.0).abs() < 1e-9);
+        assert!((c.source_span() - 8.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn cut_silence_splits_a_section_into_kept_ranges() {
+        let mut p = Project::new();
+        let mut c = clip(1, 10.0);
+        c.start = 0.0;
+        p.layers[0].clips.push(c);
+        let n = p.cut_silence(1, &[(0.0, 3.0), (7.0, 10.0)]).unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(p.layers[0].clips.len(), 2);
+        assert!((p.layers[0].clips[0].duration - 3.0).abs() < 1e-9);
+        assert!((p.layers[0].clips[1].start - 7.0).abs() < 1e-9);
+        assert!((p.layers[0].clips[1].in_point - 7.0).abs() < 1e-9);
     }
 }
 

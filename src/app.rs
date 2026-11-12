@@ -1,11 +1,12 @@
 ﻿//! The RunVideo desktop UI.
 
-use crate::ffmpeg::{self, ExportMsg};
+use crate::ffmpeg::{self, ExportMsg, EXPORT_PROFILES};
 use crate::model::{
-    is_media_path, Clip, Keyframe, Layer, MediaKind, Project, TextSpec, Transform,
-    IMAGE_DEFAULT_DURATION, MAX_CLIPS, MAX_LAYERS, MIN_CLIP,
+    is_media_path, Clip, Keyframe, Layer, MediaKind, Project, TextAlign, TextSpec, Transform,
+    VAlign, IMAGE_DEFAULT_DURATION, MAX_CLIPS, MAX_LAYERS, MIN_CLIP,
 };
 use crate::preview::{PreviewCmd, PreviewFrame, PreviewMsg, PreviewWorker};
+use crate::subs;
 use eframe::egui::{
     self, Align, Align2, Color32, CornerRadius, FontId, Key, Layout, Modifiers, Pos2, Rect,
     RichText, Sense, Shape, Stroke, StrokeKind, TextureHandle, TextureOptions, Vec2,
@@ -13,7 +14,7 @@ use eframe::egui::{
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{channel, Receiver};
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -55,6 +56,7 @@ struct ClipView {
     duration: f64,
     kind: MediaKind,
     volume: f64,
+    has_audio: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -119,6 +121,8 @@ enum PanelTab {
 pub struct RunVideoApp {
     project: Project,
     selected_clip: Option<u64>,
+    /// Extra sections selected with Ctrl+click, for multi-select edits.
+    selected_clips: BTreeSet<u64>,
     selected_layer: usize,
     position: f64,
     playing: bool,
@@ -170,6 +174,19 @@ pub struct RunVideoApp {
     /// Copied section, ready to paste. Holds a clone so edits to the original
     /// after copying don't affect the clipboard.
     clipboard: Option<Clip>,
+    /// Copied styling only, applied with "Paste settings".
+    settings_clipboard: Option<Clip>,
+    /// Cached audio peak data per media file.
+    waveforms: HashMap<PathBuf, Vec<f32>>,
+    waveform_pending: BTreeSet<PathBuf>,
+    wave_tx: Sender<(PathBuf, Vec<f32>)>,
+    wave_rx: Receiver<(PathBuf, Vec<f32>)>,
+    /// Background silence-detection job: (clip id, silent ranges).
+    silence_job: Option<Receiver<(u64, Result<Vec<(f64, f64)>, String>)>>,
+    /// Background frame-capture job.
+    capture_job: Option<Receiver<Result<PathBuf, String>>>,
+    /// Window fullscreen state toggled with F11.
+    fullscreen: bool,
     /// Snap dragged/edited times to nearby section edges and the playhead.
     snapping: bool,
 
@@ -178,6 +195,7 @@ pub struct RunVideoApp {
     export: Option<ExportState>,
     show_export: bool,
     export_preset: String,
+    export_profile: String,
 
     /// In-app shortcut/help sheet.
     show_help: bool,
@@ -212,9 +230,11 @@ impl RunVideoApp {
         });
 
         let ffmpeg_version = ffmpeg::ffmpeg_version();
+        let (wave_tx, wave_rx) = channel();
         let mut app = Self {
             project: Project::new(),
             selected_clip: None,
+            selected_clips: BTreeSet::new(),
             selected_layer: 0,
             position: 0.0,
             playing: false,
@@ -248,12 +268,21 @@ impl RunVideoApp {
             preview_drag: None,
             trim_drag: None,
             clipboard: None,
+            settings_clipboard: None,
+            waveforms: HashMap::new(),
+            waveform_pending: BTreeSet::new(),
+            wave_tx,
+            wave_rx,
+            silence_job: None,
+            capture_job: None,
+            fullscreen: false,
             snapping: true,
             status: None,
             ffmpeg_version,
             export: None,
             show_export: false,
             export_preset: "medium".to_owned(),
+            export_profile: "mp4".to_owned(),
             show_help: false,
             last_autosave: Instant::now(),
             recovery: None,
@@ -291,6 +320,7 @@ impl RunVideoApp {
         project.path = Some(path.to_path_buf());
         self.project = project;
         self.selected_clip = None;
+        self.selected_clips.clear();
         self.selected_layer = 0;
         self.panel_tab = PanelTab::Section;
         self.position = 0.0;
@@ -368,6 +398,11 @@ impl RunVideoApp {
                 self.selected_clip = None;
             }
         }
+        self.selected_clips
+            .retain(|id| self.project.find_clip(*id).is_some());
+        if let Some(id) = self.selected_clip {
+            self.selected_clips.insert(id);
+        }
         if self.selected_layer >= self.project.layers.len() {
             self.selected_layer = self.project.layers.len().saturating_sub(1);
         }
@@ -404,6 +439,7 @@ impl RunVideoApp {
         self.playing = false;
         self.position = self.position.min(self.project.duration());
         self.selected_clip = None;
+        self.selected_clips.clear();
         self.selected_layer = self.selected_layer.min(self.project.layers.len().saturating_sub(1));
         self.revision = self.revision.wrapping_add(1);
         self.last_frame_key = None;
@@ -417,6 +453,7 @@ impl RunVideoApp {
     fn new_project(&mut self, ctx: &egui::Context) {
         self.project = Project::new();
         self.selected_clip = None;
+        self.selected_clips.clear();
         self.selected_layer = 0;
         self.position = 0.0;
         self.playing = false;
@@ -744,6 +781,11 @@ impl RunVideoApp {
     }
 
     fn delete_selected(&mut self) {
+        // A multi-selection deletes as one ripple edit so no holes are left.
+        if self.selected_clips.len() > 1 {
+            self.ripple_delete_selected();
+            return;
+        }
         let Some(id) = self.selected_clip else {
             self.set_status("Select a section first, then press X to delete it.", true);
             return;
@@ -855,6 +897,458 @@ impl RunVideoApp {
         self.selected_layer = li;
         self.after_edit();
         self.set_status("Section duplicated.", false);
+    }
+
+    // ------------------------------------------------------------------
+    // Section settings clipboard, multi-select and structural edits
+    // ------------------------------------------------------------------
+
+    /// Copy every visual/audio setting (but not identity or timing).
+    fn copy_settings(&mut self) {
+        let Some(id) = self.selected_clip else {
+            self.set_status("Select a section to copy its settings.", true);
+            return;
+        };
+        let Some((li, ci)) = self.project.find_clip(id) else {
+            return;
+        };
+        self.settings_clipboard = Some(self.project.layers[li].clips[ci].clone());
+        self.set_status("Section settings copied.", false);
+    }
+
+    fn paste_settings(&mut self) {
+        let Some(src) = self.settings_clipboard.clone() else {
+            self.set_status("No section settings copied yet.", true);
+            return;
+        };
+        let Some(id) = self.selected_clip else {
+            self.set_status("Select a section to paste settings onto.", true);
+            return;
+        };
+        let Some((li, ci)) = self.project.find_clip(id) else {
+            return;
+        };
+        if self.layer_locked(li) {
+            self.set_status("That track is locked. Unlock it to edit.", true);
+            return;
+        }
+        self.snapshot();
+        let dst = &mut self.project.layers[li].clips[ci];
+        dst.transform = src.transform;
+        dst.keyframes = src.keyframes.clone();
+        dst.speed = src.speed;
+        dst.speed_end = src.speed_end;
+        dst.reverse = src.reverse;
+        dst.freeze = src.freeze;
+        dst.volume = src.volume;
+        dst.fade_in = src.fade_in.min(dst.duration);
+        dst.fade_out = src.fade_out.min(dst.duration);
+        dst.brightness = src.brightness;
+        dst.contrast = src.contrast;
+        dst.saturation = src.saturation;
+        dst.blur = src.blur;
+        dst.rotation = src.rotation;
+        dst.crop_l = src.crop_l;
+        dst.crop_r = src.crop_r;
+        dst.crop_t = src.crop_t;
+        dst.crop_b = src.crop_b;
+        dst.pixelate = src.pixelate;
+        dst.sharpen = src.sharpen;
+        dst.vignette = src.vignette;
+        dst.flip_h = src.flip_h;
+        dst.flip_v = src.flip_v;
+        if dst.kind.is_text() {
+            if let Some(mut text) = src.text.clone() {
+                if let Some(current) = &dst.text {
+                    text.content = current.content.clone();
+                }
+                dst.text = Some(text);
+            }
+        }
+        if dst.kind.is_video() {
+            let max_dur = dst
+                .source_duration
+                .map(|sd| ((sd - dst.in_point) / dst.avg_speed().max(0.05)).max(MIN_CLIP))
+                .unwrap_or(3600.0);
+            dst.duration = dst.duration.clamp(MIN_CLIP, max_dur);
+        }
+        self.after_edit();
+        self.set_status("Section settings pasted.", false);
+    }
+
+    /// Pack the selected track's sections back-to-back, closing every gap.
+    fn close_gaps_selected(&mut self) {
+        let layer = self.selected_layer.min(self.project.layers.len().saturating_sub(1));
+        if self.layer_locked(layer) {
+            self.set_status("That track is locked. Unlock it to edit.", true);
+            return;
+        }
+        self.snapshot();
+        let moved = self.project.close_gaps(layer);
+        if moved == 0 {
+            self.undo.pop();
+            self.set_status("That track has no gaps to close.", false);
+            return;
+        }
+        self.after_edit();
+        self.set_status(format!("Closed {moved} gap(s) on the selected track."), false);
+    }
+
+    /// Ripple-delete every selected section and close the holes left behind.
+    fn ripple_delete_selected(&mut self) {
+        let mut ids: Vec<u64> = self.selected_clips.iter().copied().collect();
+        if ids.is_empty() {
+            if let Some(id) = self.selected_clip {
+                ids.push(id);
+            }
+        }
+        if ids.is_empty() {
+            self.set_status("Select one or more sections to ripple delete.", true);
+            return;
+        }
+        for id in &ids {
+            if let Some((li, _)) = self.project.find_clip(*id) {
+                if self.layer_locked(li) {
+                    self.set_status("A selected section is on a locked track.", true);
+                    return;
+                }
+            }
+        }
+        self.snapshot();
+        let removed = self.project.ripple_delete(&ids);
+        if removed == 0 {
+            self.undo.pop();
+            self.set_status("Those sections no longer exist.", true);
+            return;
+        }
+        self.selected_clip = None;
+        self.selected_clips.clear();
+        self.after_edit();
+        self.set_status(
+            format!("Ripple-deleted {removed} section(s); later sections moved left."),
+            false,
+        );
+    }
+
+    /// Insert the clipboard section at the playhead, shifting later sections on
+    /// the target track to the right so nothing is overwritten.
+    fn insert_edit_clipboard(&mut self) {
+        let Some(mut clip) = self.clipboard.clone() else {
+            self.set_status("Copy a section first (Ctrl+C), then insert-edit it.", true);
+            return;
+        };
+        if self.project.total_clips() >= MAX_CLIPS {
+            self.set_status(
+                format!("Section limit reached (maximum {MAX_CLIPS} sections per project)."),
+                true,
+            );
+            return;
+        }
+        let target = self
+            .hovered_layer
+            .unwrap_or(self.selected_layer)
+            .min(self.project.layers.len().saturating_sub(1));
+        if self.layer_locked(target) {
+            self.set_status("That track is locked. Unlock it to edit.", true);
+            return;
+        }
+        let at = self.position.max(0.0);
+        let span = clip.duration;
+        clip.id = self.project.alloc_id();
+        let new_id = clip.id;
+        self.snapshot();
+        for c in &mut self.project.layers[target].clips {
+            if c.start.max(0.0) >= at - 1e-6 {
+                c.start += span;
+            }
+        }
+        match self.project.insert_clip_at(target, at, clip) {
+            Ok(()) => {
+                self.selected_clip = Some(new_id);
+                self.selected_layer = target;
+                self.after_edit();
+                self.set_status("Insert edit: later sections moved right.", false);
+            }
+            Err(e) => {
+                self.undo.pop();
+                self.set_status(e, true);
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Frame capture, fullscreen, subtitles, silence, waveforms
+    // ------------------------------------------------------------------
+
+    fn capture_current_frame(&mut self) {
+        if self.ffmpeg_version.is_none() {
+            self.set_status("FFmpeg is required to capture frames.", true);
+            return;
+        }
+        if self.project.total_clips() == 0 {
+            self.set_status("Add media before capturing a frame.", true);
+            return;
+        }
+        let default_name = format!(
+            "{}_frame_{}.png",
+            safe_file_name(&self.project.name),
+            (self.position * 1000.0).round() as i64
+        );
+        let mut dialog = rfd::FileDialog::new()
+            .add_filter("PNG image", &["png"])
+            .set_file_name(default_name);
+        if let Some(dir) = self.project.path.as_ref().and_then(|p| p.parent()) {
+            dialog = dialog.set_directory(dir);
+        }
+        let Some(mut path) = dialog.save_file() else {
+            return;
+        };
+        if path.extension().is_none() {
+            path.set_extension("png");
+        }
+        let project = self.project.clone();
+        let t = self.position;
+        let (tx, rx) = channel();
+        let out = path.clone();
+        std::thread::Builder::new()
+            .name("runvideo-capture".to_owned())
+            .spawn(move || {
+                let _ = tx.send(
+                    ffmpeg::capture_frame(&project, t, &out)
+                        .map(|()| out)
+                        .map_err(|e| e.to_string()),
+                );
+            })
+            .expect("could not start frame capture thread");
+        self.capture_job = Some(rx);
+        self.set_status(format!("Capturing frame to {}...", path.display()), false);
+    }
+
+    fn poll_capture(&mut self) {
+        let Some(rx) = &self.capture_job else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok(path)) => {
+                self.capture_job = None;
+                self.set_status(format!("Frame saved: {}", path.display()), false);
+            }
+            Ok(Err(e)) => {
+                self.capture_job = None;
+                self.set_status(format!("Frame capture failed: {e}"), true);
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.capture_job = None;
+                self.set_status("Frame capture failed.", true);
+            }
+        }
+    }
+
+    fn toggle_fullscreen(&mut self, ctx: &egui::Context) {
+        self.fullscreen = !self.fullscreen;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
+        ctx.request_repaint();
+    }
+
+    fn import_srt(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("SubRip subtitles", &["srt"])
+            .pick_file()
+        else {
+            return;
+        };
+        let subs = match subs::read_srt(&path) {
+            Ok(s) => s,
+            Err(e) => {
+                self.set_status(format!("Could not import subtitles: {e}"), true);
+                return;
+            }
+        };
+        if self.project.total_clips() + subs.len() > MAX_CLIPS {
+            self.set_status(
+                format!("Importing {} subtitles would exceed the {MAX_CLIPS}-section limit.", subs.len()),
+                true,
+            );
+            return;
+        }
+        let layer = self.selected_layer.min(self.project.layers.len().saturating_sub(1));
+        if self.layer_locked(layer) {
+            self.set_status("That track is locked. Unlock it to import subtitles.", true);
+            return;
+        }
+        self.snapshot();
+        let added = subs::import_into(&mut self.project, layer, &subs);
+        if added == 0 {
+            self.undo.pop();
+            self.set_status("No subtitles could be imported.", true);
+            return;
+        }
+        self.panel_tab = PanelTab::Section;
+        self.after_edit();
+        self.set_status(
+            format!("Imported {added} subtitle(s) as text sections (burned in on export)."),
+            false,
+        );
+    }
+
+    fn export_srt(&mut self) {
+        let entries = subs::collect_from(&self.project);
+        if entries.is_empty() {
+            self.set_status("No text sections to export as subtitles.", true);
+            return;
+        }
+        let default_name = format!("{}.srt", safe_file_name(&self.project.name));
+        let mut dialog = rfd::FileDialog::new()
+            .add_filter("SubRip subtitles", &["srt"])
+            .set_file_name(default_name);
+        if let Some(dir) = self.project.path.as_ref().and_then(|p| p.parent()) {
+            dialog = dialog.set_directory(dir);
+        }
+        let Some(mut path) = dialog.save_file() else {
+            return;
+        };
+        if path.extension().is_none() {
+            path.set_extension("srt");
+        }
+        match subs::save_srt(&path, &entries) {
+            Ok(()) => self.set_status(
+                format!("Exported {} subtitle(s) to {}", entries.len(), path.display()),
+                false,
+            ),
+            Err(e) => self.set_status(format!("Could not export subtitles: {e}"), true),
+        }
+    }
+
+    fn cut_silence_selected(&mut self) {
+        let Some(id) = self.selected_clip else {
+            self.set_status("Select a video section to cut its silence.", true);
+            return;
+        };
+        let Some((li, ci)) = self.project.find_clip(id) else {
+            return;
+        };
+        if self.layer_locked(li) {
+            self.set_status("That track is locked. Unlock it to edit.", true);
+            return;
+        }
+        let clip = &self.project.layers[li].clips[ci];
+        if !clip.kind.is_video() {
+            self.set_status("Silence detection only works on video sections.", true);
+            return;
+        }
+        let path = clip.path.clone();
+        let start = clip.in_point.max(0.0);
+        let duration = clip.source_span().max(MIN_CLIP);
+        let (tx, rx) = channel();
+        std::thread::Builder::new()
+            .name("runvideo-silence".to_owned())
+            .spawn(move || {
+                let result = ffmpeg::detect_silence(&path, start, duration, -35.0, 0.4)
+                    .map_err(|e| e.to_string());
+                let _ = tx.send((id, result));
+            })
+            .expect("could not start silence detection thread");
+        self.silence_job = Some(rx);
+        self.set_status("Detecting silence...", false);
+    }
+
+    fn poll_silence(&mut self) {
+        let Some(rx) = &self.silence_job else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok((id, Ok(ranges))) => {
+                self.silence_job = None;
+                if ranges.is_empty() {
+                    self.set_status("No silence longer than 0.4 s was found.", false);
+                    return;
+                }
+                let Some((li, ci)) = self.project.find_clip(id) else {
+                    self.set_status("That section no longer exists.", true);
+                    return;
+                };
+                let speed = self.project.layers[li].clips[ci].avg_speed().max(0.05);
+                let duration = self.project.layers[li].clips[ci].duration;
+                // Build the complement of the silent ranges (timeline-local).
+                let mut keep: Vec<(f64, f64)> = Vec::new();
+                let mut cursor = 0.0;
+                for (a, b) in ranges {
+                    let a = (a / speed).clamp(0.0, duration);
+                    let b = (b / speed).clamp(0.0, duration);
+                    if a > cursor + 0.01 {
+                        keep.push((cursor, a));
+                    }
+                    cursor = cursor.max(b);
+                }
+                if cursor < duration - 0.01 {
+                    keep.push((cursor, duration));
+                }
+                if keep.is_empty() {
+                    self.set_status("The whole section is silent; nothing to keep.", false);
+                    return;
+                }
+                self.snapshot();
+                match self.project.cut_silence(id, &keep) {
+                    Ok(n) => {
+                        self.selected_clip = None;
+                        self.after_edit();
+                        self.set_status(
+                            format!("Silence removed: section split into {n} kept piece(s)."),
+                            false,
+                        );
+                    }
+                    Err(e) => {
+                        self.undo.pop();
+                        self.set_status(e, true);
+                    }
+                }
+            }
+            Ok((_, Err(e))) => {
+                self.silence_job = None;
+                self.set_status(format!("Silence detection failed: {e}"), true);
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.silence_job = None;
+                self.set_status("Silence detection failed.", true);
+            }
+        }
+    }
+
+    /// Request waveform data for every video file in the project.
+    fn ensure_waveforms(&mut self) {
+        let paths: BTreeSet<PathBuf> = self
+            .project
+            .layers
+            .iter()
+            .flat_map(|l| l.clips.iter())
+            .filter(|c| c.kind.is_video() && c.has_audio)
+            .map(|c| c.path.clone())
+            .collect();
+        for path in paths {
+            if self.waveforms.contains_key(&path) || self.waveform_pending.contains(&path) {
+                continue;
+            }
+            let tx = self.wave_tx.clone();
+            let p = path.clone();
+            self.waveform_pending.insert(path);
+            std::thread::Builder::new()
+                .name("runvideo-waveform".to_owned())
+                .spawn(move || {
+                    if let Ok(peaks) = ffmpeg::waveform(&p, None, 600) {
+                        let _ = tx.send((p, peaks));
+                    }
+                })
+                .ok();
+        }
+    }
+
+    fn poll_waveforms(&mut self) {
+        while let Ok((path, peaks)) = self.wave_rx.try_recv() {
+            self.waveform_pending.remove(&path);
+            self.waveforms.insert(path, peaks);
+        }
     }
 
     fn move_selected_in_layer(&mut self, direction: i32) {
@@ -1341,9 +1835,14 @@ impl RunVideoApp {
             self.set_status("Add media before exporting.", true);
             return;
         }
-        let default_name = format!("{}.mp4", safe_file_name(&self.project.name));
+        let (ext, filter_name) = match self.export_profile.as_str() {
+            "gif" => ("gif", "Animated GIF"),
+            "audio" => ("m4a", "M4A audio"),
+            _ => ("mp4", "MP4 video"),
+        };
+        let default_name = format!("{}.{ext}", safe_file_name(&self.project.name));
         let mut dialog = rfd::FileDialog::new()
-            .add_filter("MP4 video", &["mp4"])
+            .add_filter(filter_name, &[ext])
             .set_file_name(default_name);
         if let Some(dir) = self.project.path.as_ref().and_then(|p| p.parent()) {
             dialog = dialog.set_directory(dir);
@@ -1352,7 +1851,7 @@ impl RunVideoApp {
             return;
         };
         if path.extension().is_none() {
-            path.set_extension("mp4");
+            path.set_extension(ext);
         }
         self.start_export(path);
     }
@@ -1375,9 +1874,10 @@ impl RunVideoApp {
         let project = self.project.clone();
         let out = path.clone();
         let preset = self.export_preset.clone();
+        let profile = self.export_profile.clone();
         std::thread::Builder::new()
             .name("runvideo-export".to_owned())
-            .spawn(move || ffmpeg::run_export(project, out, preset, cancel_thread, tx))
+            .spawn(move || ffmpeg::run_export(project, out, preset, profile, cancel_thread, tx))
             .expect("could not start export thread");
         self.export = Some(ExportState {
             rx,
@@ -1476,6 +1976,9 @@ impl RunVideoApp {
         if ctx.input(|i| i.key_pressed(Key::F1)) {
             self.show_help = !self.show_help;
         }
+        if ctx.input(|i| i.key_pressed(Key::F11)) {
+            self.toggle_fullscreen(ctx);
+        }
         if ctrl {
             if ctx.input(|i| i.key_pressed(Key::Z)) {
                 if shift {
@@ -1548,6 +2051,9 @@ impl RunVideoApp {
             }
         }
         if ctx.input(|i| i.key_pressed(Key::Escape)) {
+            if self.fullscreen {
+                self.toggle_fullscreen(&ctx);
+            }
             self.drag_clip = None;
         }
     }
@@ -1599,6 +2105,23 @@ impl RunVideoApp {
                         .clicked()
                     {
                         self.show_help = true;
+                    }
+                    if ui
+                        .add_enabled(
+                            self.ffmpeg_version.is_some() && self.project.total_clips() > 0,
+                            egui::Button::new("Capture"),
+                        )
+                        .on_hover_text("Save the frame at the playhead as a PNG")
+                        .clicked()
+                    {
+                        self.capture_current_frame();
+                    }
+                    if ui
+                        .button(if self.fullscreen { "Windowed" } else { "Fullscreen" })
+                        .on_hover_text("Toggle fullscreen preview (F11)")
+                        .clicked()
+                    {
+                        self.toggle_fullscreen(&ctx);
                     }
                     ui.separator();
                     if ui
@@ -1802,6 +2325,7 @@ impl RunVideoApp {
                         duration: c.duration,
                         kind: c.kind,
                         volume: c.volume,
+                        has_audio: c.has_audio,
                     })
                     .collect();
                 LayerView {
@@ -2365,8 +2889,28 @@ impl RunVideoApp {
             self.seek(t);
         }
         if let Some((id, layer)) = clicked_clip {
-            self.selected_clip = Some(id);
-            self.selected_layer = layer;
+            let additive = ui.ctx().input(|i| i.modifiers.ctrl || i.modifiers.command);
+            if additive {
+                if self.selected_clips.contains(&id) {
+                    self.selected_clips.remove(&id);
+                } else {
+                    self.selected_clips.insert(id);
+                }
+            } else {
+                self.selected_clips.clear();
+                self.selected_clips.insert(id);
+            }
+            if self.selected_clips.is_empty() {
+                self.selected_clip = None;
+            } else if self.selected_clips.contains(&id) {
+                self.selected_clip = Some(id);
+                self.selected_layer = layer;
+            } else if let Some(next) = self.selected_clips.iter().next().copied() {
+                self.selected_clip = Some(next);
+                if let Some((li, _)) = self.project.find_clip(next) {
+                    self.selected_layer = li;
+                }
+            }
         }
         if let Some(layer) = selected_layer_action {
             self.selected_layer = layer;
@@ -2738,7 +3282,8 @@ impl RunVideoApp {
                     egui::pos2(left, r.rect.top() + 3.0),
                     egui::pos2(right.max(left + 6.0), r.rect.bottom() - 3.0),
                 );
-                let is_selected = Some(cv.id) == selected_clip;
+                let is_selected = Some(cv.id) == selected_clip
+                    || self.selected_clips.contains(&cv.id);
                 let base = match cv.kind {
                     MediaKind::Video => VIDEO_BG,
                     MediaKind::Image => IMAGE_BG,
@@ -2764,6 +3309,34 @@ impl RunVideoApp {
                 );
 
                 let clipped = content_painter.with_clip_rect(rect.shrink(1.0));
+                // Audio waveform (cached per media file).
+                if cv.kind.is_video() && cv.has_audio {
+                    if let Some(peaks) = self.waveforms.get(&cv.path) {
+                        if !peaks.is_empty() {
+                            let inner = rect.shrink2(egui::vec2(3.0, 5.0));
+                            let mid = inner.center().y;
+                            let amp = inner.height() * 0.44;
+                            let n = inner.width().max(1.0) as usize;
+                            let color = if lv.visible {
+                                Color32::from_rgba_unmultiplied(210, 235, 255, 150)
+                            } else {
+                                Color32::from_rgba_unmultiplied(160, 160, 170, 90)
+                            };
+                            for i in 0..n {
+                                let idx = (i * peaks.len() / n).min(peaks.len() - 1);
+                                let v = peaks[idx].clamp(0.0, 1.0);
+                                let x = inner.left() + i as f32;
+                                clipped.line_segment(
+                                    [
+                                        egui::pos2(x, mid - v * amp),
+                                        egui::pos2(x, mid + v * amp),
+                                    ],
+                                    Stroke::new(1.0, color),
+                                );
+                            }
+                        }
+                    }
+                }
                 let mut text_left = rect.left() + 6.0;
                 if let Some(tex) = thumb_map.get(&cv.path) {
                     if rect.width() > 62.0 {
@@ -3236,6 +3809,7 @@ impl RunVideoApp {
         let mut changed = false;
         let layer_origin = self.project.layers[li].start.max(0.0);
         let mut new_start: Option<f64> = None;
+        let mut want_silence = false;
         {
             let clip = &mut self.project.layers[li].clips[ci];
             // ---- Position on the timeline ----------------------------------
@@ -3295,6 +3869,86 @@ impl RunVideoApp {
                     }
                     if let Some(bg) = &mut spec.background {
                         text_changed |= color_edit(ui, bg);
+                    }
+                });
+                ui.add_space(2.0);
+                ui.label(RichText::new("Style").small().strong());
+                ui.horizontal(|ui| {
+                    ui.label("Outline");
+                    text_changed |= ui
+                        .add(
+                            egui::DragValue::new(&mut spec.outline)
+                                .range(0.0..=80.0)
+                                .speed(0.2),
+                        )
+                        .changed();
+                    if spec.outline > 0.01 {
+                        text_changed |= color_edit(ui, &mut spec.outline_color);
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Shadow");
+                    text_changed |= ui
+                        .add(
+                            egui::DragValue::new(&mut spec.shadow)
+                                .range(0.0..=80.0)
+                                .speed(0.2),
+                        )
+                        .changed();
+                    if spec.shadow > 0.01 {
+                        text_changed |= color_edit(ui, &mut spec.shadow_color);
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Align");
+                    egui::ComboBox::from_id_salt(("text_align", clip.id))
+                        .selected_text(format!("{:?} / {:?}", spec.align, spec.valign))
+                        .show_ui(ui, |ui| {
+                            for a in [TextAlign::Left, TextAlign::Center, TextAlign::Right] {
+                                for v in [VAlign::Top, VAlign::Middle, VAlign::Bottom] {
+                                    if ui
+                                        .selectable_label(
+                                            spec.align == a && spec.valign == v,
+                                            format!("{a:?} / {v:?}"),
+                                        )
+                                        .clicked()
+                                    {
+                                        spec.align = a;
+                                        spec.valign = v;
+                                        text_changed = true;
+                                    }
+                                }
+                            }
+                        });
+                });
+                ui.label(RichText::new("Title templates").small().strong());
+                ui.horizontal_wrapped(|ui| {
+                    for (label, size, outline, shadow, align, valign, boxed, bold) in [
+                        ("Title", 96.0, 4.0, 8.0, TextAlign::Center, VAlign::Middle, false, true),
+                        ("Lower third", 46.0, 2.0, 3.0, TextAlign::Left, VAlign::Bottom, true, true),
+                        ("Caption", 40.0, 3.0, 3.0, TextAlign::Center, VAlign::Bottom, false, true),
+                        ("Big centre", 130.0, 6.0, 10.0, TextAlign::Center, VAlign::Middle, false, true),
+                        ("Top banner", 54.0, 2.0, 3.0, TextAlign::Center, VAlign::Top, true, true),
+                    ] {
+                        if ui
+                            .add(egui::Button::new(label).small())
+                            .on_hover_text("Apply a ready-made title style")
+                            .clicked()
+                        {
+                            spec.size = size;
+                            spec.outline = outline;
+                            spec.shadow = shadow;
+                            spec.align = align;
+                            spec.valign = valign;
+                            spec.bold = bold;
+                            spec.color = "#ffffff".to_owned();
+                            spec.background = if boxed {
+                                Some("#000000".to_owned())
+                            } else {
+                                None
+                            };
+                            text_changed = true;
+                        }
                     }
                 });
                 if text_changed {
@@ -3382,6 +4036,63 @@ impl RunVideoApp {
                     }
                 }
             });
+            if kind == MediaKind::Video {
+                ui.horizontal(|ui| {
+                    let mut ramped = clip.speed_end.is_some();
+                    if ui
+                        .checkbox(&mut ramped, "Speed ramp to")
+                        .on_hover_text("Linearly change speed from this section's start rate to the end rate")
+                        .changed()
+                    {
+                        clip.speed_end = if ramped { Some(clip.speed) } else { None };
+                        changed = true;
+                    }
+                    if let Some(end) = clip.speed_end {
+                        let mut end = end;
+                        if ui
+                            .add(
+                                egui::DragValue::new(&mut end)
+                                    .range(0.05..=8.0)
+                                    .speed(0.01)
+                                    .suffix("x"),
+                            )
+                            .changed()
+                        {
+                            clip.speed_end = Some(end.clamp(0.05, 8.0));
+                            changed = true;
+                        }
+                    }
+                });
+                ui.horizontal(|ui| {
+                    changed |= ui
+                        .add_enabled(
+                            !clip.freeze,
+                            egui::Checkbox::new(&mut clip.reverse, "Reverse"),
+                        )
+                        .on_hover_text("Play this section backwards (video and audio)")
+                        .changed();
+                    if ui
+                        .checkbox(&mut clip.freeze, "Freeze frame")
+                        .on_hover_text("Hold the first frame of the section for its whole length")
+                        .changed()
+                    {
+                        if clip.freeze {
+                            clip.reverse = false;
+                            clip.speed_end = None;
+                        }
+                        changed = true;
+                    }
+                });
+                if has_audio && !clip.freeze {
+                    if ui
+                        .button("Cut silence")
+                        .on_hover_text("Detect quiet passages and keep only the audible parts")
+                        .clicked()
+                    {
+                        want_silence = true;
+                    }
+                }
+            }
 
             // ---- Audio (video only) -----------------------------------------
             if kind == MediaKind::Video && has_audio {
@@ -3583,6 +4294,9 @@ impl RunVideoApp {
             self.project.layers[li].clips[ci].start = start;
             changed = true;
         }
+        if want_silence {
+            self.cut_silence_selected();
+        }
 
         ui.horizontal(|ui| {
             let mut split = false;
@@ -3648,6 +4362,53 @@ impl RunVideoApp {
                 self.move_selected_in_layer(1);
             }
         });
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .button("Copy settings")
+                .on_hover_text("Copy this section's style, speed, transform and effects")
+                .clicked()
+            {
+                self.copy_settings();
+            }
+            if ui
+                .button("Paste settings")
+                .on_hover_text("Apply the copied settings to this section")
+                .clicked()
+            {
+                self.paste_settings();
+            }
+            if ui
+                .button("Ripple delete")
+                .on_hover_text("Delete the selection and move later sections left")
+                .clicked()
+            {
+                self.ripple_delete_selected();
+            }
+            if ui
+                .button("Insert edit")
+                .on_hover_text("Insert the copied section at the playhead, shifting later sections right")
+                .clicked()
+            {
+                self.insert_edit_clipboard();
+            }
+            if ui
+                .button("Close gaps")
+                .on_hover_text("Pack this track's sections back-to-back")
+                .clicked()
+            {
+                self.close_gaps_selected();
+            }
+        });
+        if self.selected_clips.len() > 1 {
+            ui.label(
+                RichText::new(format!(
+                    "{} sections selected - click with Ctrl to add/remove, X ripple-deletes them.",
+                    self.selected_clips.len()
+                ))
+                .small()
+                .weak(),
+            );
+        }
         if changed {
             self.after_edit();
         }
@@ -3995,6 +4756,52 @@ impl RunVideoApp {
                     .weak(),
             );
         });
+        ui.horizontal(|ui| {
+            ui.label("Export format");
+            let current = EXPORT_PROFILES
+                .iter()
+                .find(|(_, id)| *id == self.export_profile)
+                .map(|(label, _)| *label)
+                .unwrap_or("MP4 - project size");
+            let mut selected: Option<&'static str> = None;
+            egui::ComboBox::from_id_salt("export_profile")
+                .selected_text(current)
+                .show_ui(ui, |ui| {
+                    for (label, id) in EXPORT_PROFILES {
+                        if ui
+                            .selectable_label(self.export_profile == *id, *label)
+                            .clicked()
+                        {
+                            selected = Some(id);
+                        }
+                    }
+                })
+                .response
+                .on_hover_text("Output size/format; vertical and square are made for social video");
+            if let Some(id) = selected {
+                self.export_profile = id.to_owned();
+            }
+        });
+        ui.checkbox(&mut self.project.normalize_audio, "Normalize loudness (-16 LUFS)")
+            .on_hover_text("EBU R128 loudness normalisation and peak limiting on export");
+        ui.separator();
+        ui.label(RichText::new("Subtitles").small().strong());
+        ui.horizontal(|ui| {
+            if ui
+                .button("Import SRT")
+                .on_hover_text("Turn SRT cues into text sections on the selected track (burned in on export)")
+                .clicked()
+            {
+                self.import_srt();
+            }
+            if ui
+                .button("Export SRT")
+                .on_hover_text("Write every text section to an SRT file")
+                .clicked()
+            {
+                self.export_srt();
+            }
+        });
         if let Some(path) = &self.project.path {
             ui.add(
                 egui::Label::new(RichText::new(path.display().to_string()).small().weak())
@@ -4228,9 +5035,13 @@ impl RunVideoApp {
             if room > 300.0 {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.label(
-                        RichText::new("Preview is muted - export includes mixed audio")
-                            .small()
-                            .weak(),
+                        RichText::new(if self.fullscreen {
+                            "Fullscreen preview - F11 or Esc to exit"
+                        } else {
+                            "Preview is muted - export includes mixed audio"
+                        })
+                        .small()
+                        .weak(),
                     );
                 });
             }
@@ -4570,6 +5381,7 @@ impl RunVideoApp {
                                 ("X / Delete", "Delete the selected section"),
                                 ("Ctrl+D", "Duplicate the selected section"),
                                 ("Ctrl+C / Ctrl+V", "Copy / paste a section at the playhead"),
+                                ("Ctrl+click", "Select several sections (X ripple-deletes them)"),
                             ],
                         ),
                         (
@@ -4594,6 +5406,7 @@ impl RunVideoApp {
                                 ("Ctrl+Z / Ctrl+Y", "Undo / redo"),
                                 ("Ctrl+Plus", "Zoom the timeline to fit"),
                                 ("Ctrl+wheel", "Zoom around the pointer"),
+                                ("F11 / Esc", "Fullscreen preview on / off"),
                                 ("F1", "Show this help"),
                             ],
                         ),
@@ -4729,15 +5542,21 @@ impl eframe::App for RunVideoApp {
         let ctx = ui.ctx().clone();
         self.poll_preview(&ctx);
         self.poll_export();
+        self.poll_capture();
+        self.poll_silence();
+        self.poll_waveforms();
+        self.ensure_waveforms();
         self.handle_dropped(&ctx);
         self.handle_shortcuts(&ctx);
         self.tick_playback(&ctx);
         self.maybe_autosave(&ctx);
 
-        self.recovery_bar(&ctx, ui);
-        self.top_bar(ui);
-        self.timeline_panel(ui);
-        self.right_panel(ui);
+        if !self.fullscreen {
+            self.recovery_bar(&ctx, ui);
+            self.top_bar(ui);
+            self.timeline_panel(ui);
+            self.right_panel(ui);
+        }
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(PANEL_BG).inner_margin(egui::Margin::same(8)))
             .show(ui, |ui| {

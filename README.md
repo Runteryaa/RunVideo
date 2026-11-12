@@ -28,6 +28,19 @@ codec can never take the application down with it.
 | **Track gain** | A per-track volume control applied on top of every section's own volume |
 | **Timeline markers** | Drop reference markers (`M`) and jump between them |
 | **Loop playback** | Replay the whole timeline when playback ends |
+| **Vertical / square presets** | `vertical` (1080×1920) and `square` (1080×1080) export profiles |
+| **Export presets** | MP4 (project size / 1080p / 720p), vertical, square, GIF and audio-only M4A |
+| **Fullscreen preview** | `F11` (or the toolbar button) hides the panels and fills the window; `Esc` exits |
+| **Frame capture** | **Capture** saves the exact frame at the playhead as a PNG |
+| **Copy / paste section settings** | Copy style, speed, transform and effects from one section and apply them to another |
+| **Close gaps** | Pack a track's sections back-to-back in one click |
+| **Text outline, shadow and alignment** | Per-section outline/shadow with 9-way alignment plus 5 title templates |
+| **Audio waveforms** | Waveforms drawn inside video sections on the timeline |
+| **SRT import / export** | SRT cues become text sections (burned in on export); text sections export back to SRT |
+| **Speed ramp / reverse / freeze** | Per-section linear speed ramp, reverse playback and freeze-frame |
+| **Silence auto cut** | Detect quiet passages in a video section and keep only the audible parts |
+| **Multi-select, ripple and insert editing** | `Ctrl+click` multiple sections, ripple-delete them, or insert-edit the clipboard at the playhead |
+| **Loudness normalisation** | Optional EBU R128 loudness normalisation (−16 LUFS) plus peak limiting on export |
 
 Also included: snapping, undo/redo, project save/load (`.rvproj`), thumbnails,
 drag-and-drop import, frame-accurate preview, and MP4 export with mixed audio.
@@ -194,6 +207,97 @@ and pick **Move up/down**. The base track always stays at the bottom.
 Right-click a track header for **Rename**, **Add media here**, **Move up/down**
 and **Delete track**.
 
+### Export formats and presets
+
+The **Project** tab has two dropdowns:
+
+- **Export speed** — FFmpeg's x264 preset (`ultrafast` … `veryslow`).
+- **Export format** — the output size/container:
+  - **MP4 – project size** keeps the project's resolution.
+  - **MP4 – 1080p** / **MP4 – 720p** force a 16:9 size with letterboxing.
+  - **Vertical 9:16** (1080×1920) for Shorts/Reels/TikTok.
+  - **Square 1:1** (1080×1080) for feed posts.
+  - **GIF** (480 px wide, with a palette pass) — no audio.
+  - **Audio only (M4A/AAC)** exports the mixed soundtrack.
+
+The save dialog picks the matching extension. The headless CLI takes the profile
+as an optional fourth argument:
+
+```bat
+runvideo --export project.rvproj out.mp4 ultrafast vertical
+runvideo --export project.rvproj out.gif ultrafast gif
+runvideo --export project.rvproj out.m4a ultrafast audio
+```
+
+**Normalize loudness (−16 LUFS)** in the Project tab runs the mix through
+`loudnorm` and a peak limiter on export, so dialogue and music land at a
+consistent, streaming-friendly level.
+
+### Fullscreen preview and frame capture
+
+Press `F11` (or click **Fullscreen** in the toolbar) to hide the top bar, timeline
+and side panels and fill the window with the preview; `Esc` or `F11` returns.
+**Capture** in the toolbar writes the frame at the playhead to a PNG using the
+same render graph as the preview, so what you save is exactly what you see.
+
+### Copying section settings
+
+Every section can carry its own look. **Copy settings** / **Paste settings** in the
+Section tab copy the transform, keyframes, speed (including ramp/reverse/freeze),
+volume, fades, colour adjustments, crops and text style — but keep the target's
+text content, media and timing. Use it to apply one grade or title style to many
+sections quickly.
+
+### Multi-select, ripple delete and insert editing
+
+`Ctrl+click` sections on the timeline to build a multi-selection (the count is
+shown in the Section tab). With several selected:
+
+- `X` / **Ripple delete** removes them and slides later sections on each track
+  left to close the holes.
+- **Close gaps** packs the selected track back-to-back without deleting anything.
+- **Insert edit** pastes the copied section at the playhead and pushes later
+  sections on the target track to the right, so nothing is overwritten.
+
+### Speed ramps, reverse and freeze
+
+In the Section tab, a video section can set:
+
+- **Speed ramp to** — a second speed; playback rate changes linearly from the
+  section's start rate to the end rate. Audio follows the average rate.
+- **Reverse** — plays the section (and its audio) backwards.
+- **Freeze frame** — holds the first frame of the section for its whole length
+  (silent). Useful for a punch-in pause.
+
+These are combined with the per-section speed and the project-wide playback speed.
+
+### Audio waveforms and silence cutting
+
+Video sections with audio draw their waveform directly on the timeline, so cuts
+can be lined up with speech and beats. Click **Cut silence** on a selected video
+section and RunVideo runs FFmpeg's silence detector over the section, keeps the
+audible ranges and drops the rest as separate sections.
+
+### Subtitles (SRT)
+
+**Import SRT** in the Project tab turns each cue into a text section at the cue's
+time on the selected track, styled as a bottom-centre caption with outline and
+shadow; they are burned into the picture on export and stay editable like any
+other section. **Export SRT** writes every text section back out as cues on the
+project timeline. The CLI mirrors both:
+
+```bat
+runvideo --srt-import project.rvproj subs.srt project_with_subs.rvproj
+runvideo --srt-export project.rvproj out.srt
+```
+
+### Text styling and title templates
+
+Text sections have an **Outline** (width and colour), a **Shadow** (offset and
+colour) and 9-way **Align** (left/centre/right × top/middle/bottom). Five
+one-click **title templates** (Title, Lower third, Caption, Big centre, Top
+banner) set a good starting style that can still be tweaked per section.
+
 ### Export speed
 
 The project panel has an **Export speed** dropdown mapping to FFmpeg's x264
@@ -246,6 +350,7 @@ hidden.
 | `X` / `Delete` | Delete the selected section |
 | `Ctrl+D` | Duplicate the selected section |
 | `Ctrl+C` / `Ctrl+V` | Copy / paste a section at the playhead |
+| `Ctrl+click` | Add/remove a section from the multi-selection |
 | `Space` | Play — always from the start marker when one is set |
 | `Enter` | Resume playback from the current playhead (ignores the start marker) |
 | `Right Shift` | Stop playback and return to the start marker (or beginning) |
@@ -261,6 +366,7 @@ hidden.
 | `Ctrl+S` / `Ctrl+O` | Save / open project |
 | `Ctrl+E` | Export MP4 |
 | `Ctrl+N` | New project |
+| `F11` / `Esc` | Enter / leave fullscreen preview |
 | `Ctrl` + mouse wheel | Zoom the timeline around the pointer |
 
 ## Requirements
