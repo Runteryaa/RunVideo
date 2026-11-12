@@ -465,6 +465,19 @@ fn piecewise_expr(
 
 /// Build the shared video graph for both preview and export.
 fn build_graph(project: &Project, start: f64, width: u32, height: u32) -> Option<BuiltGraph> {
+    build_graph_inner(project, start, width, height, false)
+}
+
+/// `audio_only` skips every video filter so FFmpeg never decodes or scales a
+/// frame. The returned graph has an empty `final_video` and is only good for
+/// feeding `build_audio_filters`.
+fn build_graph_inner(
+    project: &Project,
+    start: f64,
+    width: u32,
+    height: u32,
+    audio_only: bool,
+) -> Option<BuiltGraph> {
     let total = project.duration();
     if total <= 0.001 {
         return None;
@@ -564,6 +577,26 @@ fn build_graph(project: &Project, start: f64, width: u32, height: u32) -> Option
                 args.push(fmt(remain));
                 args.push("-i".into());
                 args.push(clip.path.to_string_lossy().to_string());
+            }
+
+            let fade_out = clip.fade_out.clamp(0.0, remain);
+            let fade_in_left = (clip.fade_in - trim_front).clamp(0.0, remain);
+            if audio_only {
+                // Keep the metadata the audio mixer needs and skip every video
+                // filter (and therefore all video decoding).
+                cropped.push(CroppedClip {
+                    input: idx,
+                    duration: remain,
+                    offset: (clip_start - start).max(0.0),
+                    has_audio: is_video && clip.has_audio && !clip.freeze,
+                    is_video,
+                    volume: clip.volume,
+                    fade_in: fade_in_left,
+                    fade_out,
+                    avg_speed: clip.avg_speed(),
+                    reverse: clip.reverse && !clip.freeze,
+                });
+                continue;
             }
 
             // --- Normalize to a full-frame RGBA image -----------------------
@@ -742,8 +775,8 @@ fn build_graph(project: &Project, start: f64, width: u32, height: u32) -> Option
             // timestamps forward by `trim_front`, fade from zero, and shift them
             // back. That is far cheaper than a per-pixel `geq` (which used to
             // make 1080p projects take minutes per second of video).
-            let fade_out = clip.fade_out.clamp(0.0, remain);
-            let fade_in_left = (clip.fade_in - trim_front).clamp(0.0, remain);
+            // A filter chain that starts `trim_front` into the section must
+            // resume an in-progress fade at its real alpha.
             let mut faded = effected.clone();
             if fade_in_left > 0.01 {
                 let fi = clip.fade_in.max(1e-6);
@@ -923,6 +956,18 @@ fn build_graph(project: &Project, start: f64, width: u32, height: u32) -> Option
         if cropped.is_empty() {
             continue;
         }
+        if audio_only {
+            // The mixer only needs the clip layout; no video label exists.
+            layers_out.push(CroppedLayer {
+                index: li,
+                label: String::new(),
+                clips: cropped,
+                muted: layer.muted,
+                solo: layer.solo,
+                gain: layer.gain.clamp(0.0, 4.0),
+            });
+            continue;
+        }
         // Composite the layer onto a transparent canvas, positioning each
         // section at its own offset. Gaps stay transparent and overlapping
         // sections are drawn in list order (the later one on top).
@@ -962,6 +1007,17 @@ fn build_graph(project: &Project, start: f64, width: u32, height: u32) -> Option
     // frame. When the base is empty or hidden there is nothing to draw at all and
     // the black canvas below is shown instead; emitting an unused [base] label
     // would make FFmpeg reject the whole graph.
+    if audio_only {
+        // No video branch at all: the audio mix is the only output.
+        return Some(BuiltGraph {
+            args,
+            filters,
+            final_video: String::new(),
+            layers: layers_out,
+            duration,
+            start,
+        });
+    }
     if let Some(base) = layers_out.iter().find(|l| l.index == 0) {
         let base_len = (project.layers[0].duration() - start).max(0.0);
         let pad = (duration - base_len).max(0.0);
@@ -1063,6 +1119,53 @@ pub fn build_preview_plan(project: &Project, start: f64, width: u32, height: u32
         duration: graph.duration,
         start: graph.start,
     })
+}
+
+/// Build the mixed timeline audio as a raw PCM stream for live preview.
+///
+/// The graph is the same one the exporter uses from `start` to the end of the
+/// timeline (including speed, fades, track gain and the limiter), rendered to
+/// 48 kHz stereo `s16le` on stdout. Returns `None` when the project has no
+/// audible audio at all.
+pub fn build_audio_preview_args(project: &Project, start: f64) -> Option<(Vec<String>, f64)> {
+    let width = even(project.width.max(2));
+    let height = even(project.height.max(2));
+    let mut graph = build_graph_inner(project, start, width, height, true)?;
+    let duration = graph.duration;
+    if duration <= 0.001 {
+        return None;
+    }
+    // Preview mastering is deliberately light: loudnorm's lookahead would add
+    // latency and swallow the first fraction of a second of playback.
+    let (audio_filters, label) = build_audio_filters(&graph, duration, false)?;
+    graph.filters.extend(audio_filters);
+    // The audio-only graph has no video branch; only wire a nullsink if one
+    // exists (it does when a caller renders both from a full graph).
+    if !graph.final_video.is_empty() {
+        graph
+            .filters
+            .push(format!("[{}]nullsink", graph.final_video));
+    }
+    let mut args = graph.args.clone();
+    args.extend([
+        "-filter_complex".into(),
+        graph.filters.join(";"),
+        "-map".into(),
+        format!("[{label}]"),
+        "-vn".into(),
+        "-sn".into(),
+        "-dn".into(),
+        "-t".into(),
+        fmt(duration),
+        "-f".into(),
+        "s16le".into(),
+        "-ar".into(),
+        "48000".into(),
+        "-ac".into(),
+        "2".into(),
+        "-".into(),
+    ]);
+    Some((args, duration))
 }
 
 /// `atempo` filter chain for any playback rate in the editor's 0.05–8× range.
@@ -1834,5 +1937,67 @@ mod tests {
             assert!(b > a);
             assert!(b <= 4.001);
         }
+    }
+
+    #[test]
+    fn live_audio_preview_produces_the_mixed_soundtrack() {
+        let base = Path::new("sample/base.mp4");
+        if !base.exists() {
+            return;
+        }
+        let mut project = Project::new();
+        project.width = 640;
+        project.height = 360;
+        project.layers[0].clips.push(Clip {
+            id: 1,
+            path: base.to_path_buf(),
+            name: "base".to_owned(),
+            kind: MediaKind::Video,
+            duration: 2.0,
+            source_duration: Some(6.0),
+            has_audio: true,
+            ..Clip::default()
+        });
+        let (args, duration) = build_audio_preview_args(&project, 0.0).expect("audio plan");
+        assert!((duration - 2.0).abs() < 0.05, "{duration}");
+        // The preview must not decode or composite video just to hear sound.
+        let filters = args
+            .iter()
+            .position(|a| a == "-filter_complex")
+            .map(|i| args[i + 1].clone())
+            .expect("filter graph");
+        for video in ["scale=", "overlay=", "nullsink", "format=rgba"] {
+            assert!(
+                !filters.contains(video),
+                "audio-only preview still builds video filters ({video}): {filters}"
+            );
+        }
+        let out = command("ffmpeg").args(&args).output().expect("ffmpeg");
+        assert!(
+            out.status.success(),
+            "audio preview failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        // 48 kHz stereo s16 is 192 000 bytes per second; the process streams the
+        // whole section.
+        let expected = (duration * 192_000.0) as i64;
+        let actual = out.stdout.len() as i64;
+        assert!(
+            (actual - expected).abs() < 48_000,
+            "expected about {expected} bytes, got {actual}"
+        );
+        // The sample tone must actually be audible, not silence.
+        let peak = out
+            .stdout
+            .chunks_exact(2)
+            .map(|s| i16::from_le_bytes([s[0], s[1]]).unsigned_abs())
+            .max()
+            .unwrap_or(0);
+        assert!(peak > 1000, "preview audio is silent (peak {peak})");
+
+        // A project with no audio has no preview soundtrack at all.
+        let mut silent = project.clone();
+        silent.layers[0].clips[0].has_audio = false;
+        assert!(build_audio_preview_args(&silent, 0.0).is_none());
     }
 }

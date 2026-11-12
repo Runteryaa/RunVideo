@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod audio;
 mod ffmpeg;
 mod model;
 mod preview;
@@ -247,6 +248,86 @@ fn cli(args: &[String]) -> Option<i32> {
             }
             println!("Wrote {} subtitle(s) to {output}", cues.len());
             Some(0)
+        }
+        // Print the exact FFmpeg arguments used for live preview audio.
+        "--audio-args" => {
+            let Some(input) = args.get(1) else {
+                eprintln!("error: --audio-args needs <project.rvproj> [time]");
+                return Some(2);
+            };
+            let text = match std::fs::read_to_string(input) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("error: could not read {input}: {e}");
+                    return Some(1);
+                }
+            };
+            let mut project: model::Project =
+                match serde_json::from_str(text.trim_start_matches('\u{feff}')) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("error: invalid project: {e}");
+                        return Some(1);
+                    }
+                };
+            if let Err(e) = project.sanitize() {
+                eprintln!("error: {e}");
+                return Some(1);
+            }
+            let t: f64 = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(0.0);
+            match ffmpeg::build_audio_preview_args(&project, t) {
+                Some((list, duration)) => {
+                    println!("duration: {duration:.3}s");
+                    for (i, a) in list.iter().enumerate() {
+                        println!("{i:>3}: {a}");
+                    }
+                    Some(0)
+                }
+                None => {
+                    eprintln!("error: this project has no audio to preview");
+                    Some(1)
+                }
+            }
+        }
+        // Diagnostic: prove the live preview audio reaches a real device.
+        "--audio-selftest" => {
+            let Some(input) = args.get(1) else {
+                eprintln!("error: --audio-selftest needs <project.rvproj> [seconds]");
+                return Some(2);
+            };
+            let text = match std::fs::read_to_string(input) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("error: could not read {input}: {e}");
+                    return Some(1);
+                }
+            };
+            let mut project: model::Project =
+                match serde_json::from_str(text.trim_start_matches('\u{feff}')) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("error: invalid project: {e}");
+                        return Some(1);
+                    }
+                };
+            if let Err(e) = project.sanitize() {
+                eprintln!("error: {e}");
+                return Some(1);
+            }
+            let seconds: f64 = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(3.0);
+            match audio::selftest(&project, 0.0, seconds) {
+                Ok((bytes, samples)) => {
+                    println!(
+                        "Audio preview: {bytes} PCM bytes written, {samples} samples played ({:.2}s)",
+                        samples as f64 / 48_000.0
+                    );
+                    Some(0)
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    Some(1)
+                }
+            }
         }
         // Render a single preview frame with the exact graph the editor uses.
         // Handy for diagnosing "Preview render failed" without opening the GUI.

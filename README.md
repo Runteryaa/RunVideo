@@ -22,6 +22,7 @@ codec can never take the application down with it.
 | **Text sections** | Generated titles/captions with content, size, bold, colour and an optional box |
 | **Speed control** | Per-section 0.05x–8x and a whole-project playback speed; video and audio stay in sync |
 | **Audio controls** | Per-section volume, fade in/out, track mute/solo, and a limiter that stops clipping/pops |
+| **Live preview audio** | The editor plays the mixed soundtrack while previewing, exactly as the export will sound |
 | **Edge trimming** | Drag a section's left or right edge in the timeline to trim it |
 | **Colour & effects** | Per-section brightness, contrast, saturation, blur, flip, rotation, crop, pixelate, sharpen and vignette |
 | **Transitions** | One-click fade between adjacent sections, plus manual per-section fades |
@@ -278,6 +279,22 @@ can be lined up with speech and beats. Click **Cut silence** on a selected video
 section and RunVideo runs FFmpeg's silence detector over the section, keeps the
 audible ranges and drops the rest as separate sections.
 
+### Live preview audio
+
+Playback in the editor is not silent: RunVideo renders the same mix the exporter
+uses (section volume and fades, track gain/mute/solo, speed changes and the
+limiter) and streams it to the default Windows output device. The mix starts at
+the same timeline position as the picture, so seeking and restarting stay in
+sync. Preview mastering skips only the loudness-normalisation pass, whose
+lookahead would delay the first fraction of a second; the exported file still
+gets that pass. The **Live preview mix** label under the preview shows the
+soundtrack is active.
+
+Live preview audio uses the system output through `winmm`, so no extra
+dependency or setup is needed. On non-Windows builds the preview is silent while
+export still contains the mixed audio. If no output device is available, the
+editor falls back silently and playback continues.
+
 ### Subtitles (SRT)
 
 **Import SRT** in the Project tab turns each cue into a text section at the cue's
@@ -428,7 +445,9 @@ The render graph is built in `src/ffmpeg.rs`:
 5. Audio from each section is delayed to its own offset and mixed.
 
 The exact same graph feeds the preview and the exporter, so what you see is what
-you get.
+you get. Live preview audio reuses the same audio branching (and therefore the
+same volume, fades, speed and limiter) but stops after the audio stage, so the
+picture never has to be decoded twice while you listen.
 
 ## Project files
 

@@ -187,6 +187,8 @@ pub struct RunVideoApp {
     capture_job: Option<Receiver<Result<PathBuf, String>>>,
     /// Window fullscreen state toggled with F11.
     fullscreen: bool,
+    /// Live soundtrack for the preview (muted export-only no longer).
+    audio: crate::audio::AudioPlayer,
     /// Snap dragged/edited times to nearby section edges and the playhead.
     snapping: bool,
 
@@ -276,6 +278,7 @@ impl RunVideoApp {
             silence_job: None,
             capture_job: None,
             fullscreen: false,
+            audio: crate::audio::AudioPlayer::new(),
             snapping: true,
             status: None,
             ffmpeg_version,
@@ -5038,7 +5041,7 @@ impl RunVideoApp {
                         RichText::new(if self.fullscreen {
                             "Fullscreen preview - F11 or Esc to exit"
                         } else {
-                            "Preview is muted - export includes mixed audio"
+                            "Live preview mix - export matches this soundtrack"
                         })
                         .small()
                         .weak(),
@@ -5549,6 +5552,15 @@ impl eframe::App for RunVideoApp {
         self.handle_dropped(&ctx);
         self.handle_shortcuts(&ctx);
         self.tick_playback(&ctx);
+        // Drive the live soundtrack from the same state as the preview stream.
+        // Wait for the first frame: it tells us the stream is really running, so
+        // the sound does not start before the picture is on screen.
+        self.audio.sync(
+            self.playing && self.stream_time.is_some(),
+            self.gen,
+            &self.project,
+            self.stream_base,
+        );
         self.maybe_autosave(&ctx);
 
         if !self.fullscreen {
