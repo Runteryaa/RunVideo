@@ -2,6 +2,10 @@
 
 A small, fast, layer-based video editor written in Rust.
 
+**Download:** grab the latest Windows build from
+[Releases](https://github.com/Runteryaa/RunVideo/releases). FFmpeg (`ffmpeg` and
+`ffprobe`) must be on your `PATH`.
+
 RunVideo edits video and photos on a multi-layer timeline and renders the final
 result with FFmpeg. The UI runs on [egui](https://github.com/emilk/egui); media
 decoding/encoding is delegated to FFmpeg so the editor stays small and a broken
