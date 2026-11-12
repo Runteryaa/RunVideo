@@ -121,6 +121,10 @@ fn default_gain() -> f64 {
     1.0
 }
 
+fn default_speed() -> f64 {
+    1.0
+}
+
 impl Default for Clip {
     fn default() -> Self {
         Self {
@@ -368,6 +372,10 @@ pub struct Project {
     /// Free timeline markers (seconds), in ascending order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub markers: Vec<f64>,
+    /// Cumulative project-wide playback rate (1.0 = normal). Each section's own
+    /// speed is multiplied by this value when the whole project is retimed.
+    #[serde(default = "default_speed")]
+    pub speed: f64,
     #[serde(skip)]
     pub path: Option<PathBuf>,
 }
@@ -400,6 +408,7 @@ impl Project {
             }],
             start_marker: None,
             markers: Vec::new(),
+            speed: 1.0,
             path: None,
         }
     }
@@ -634,6 +643,64 @@ impl Project {
         true
     }
 
+    /// Retime the whole project to the cumulative playback rate `target`
+    /// (2.0 = twice as fast).
+    ///
+    /// Sections keep the same source range: their timeline length and start
+    /// shrink by the ratio while their own speed grows by it. Gaps, markers and
+    /// keyframes are scaled the same way, so the edit keeps its arrangement.
+    /// Returns the factor that was actually applied (`1.0` = nothing changed).
+    pub fn set_global_speed(&mut self, target: f64) -> f64 {
+        let target = target.clamp(0.1, 4.0);
+        let current = self.speed.clamp(0.1, 4.0);
+        let mut ratio = target / current;
+        // Do not push any single section outside the supported speed range.
+        let mut max_speed: f64 = 0.0;
+        let mut min_speed = f64::INFINITY;
+        for layer in &self.layers {
+            for c in &layer.clips {
+                max_speed = max_speed.max(c.speed);
+                min_speed = min_speed.min(c.speed);
+            }
+        }
+        if max_speed > 0.0 {
+            ratio = ratio.min((8.0 / max_speed).max(1.0));
+        }
+        if min_speed.is_finite() && min_speed > 0.0 {
+            ratio = ratio.max((0.05 / min_speed).min(1.0));
+        }
+        if (ratio - 1.0).abs() < 1e-9 {
+            return 1.0;
+        }
+        let inv = 1.0 / ratio;
+        for layer in &mut self.layers {
+            layer.start = (layer.start * inv).max(0.0);
+            for c in &mut layer.clips {
+                c.start = (c.start * inv).max(0.0);
+                c.duration = (c.duration * inv).max(MIN_CLIP);
+                c.speed = (c.speed * ratio).clamp(0.05, 8.0);
+                c.fade_in = (c.fade_in * inv).clamp(0.0, c.duration);
+                c.fade_out = (c.fade_out * inv).clamp(0.0, c.duration);
+                for key in &mut c.keyframes {
+                    key.time = (key.time * inv).clamp(0.0, c.duration);
+                }
+            }
+        }
+        if let Some(m) = &mut self.start_marker {
+            *m = (*m * inv).max(0.0);
+        }
+        for m in &mut self.markers {
+            *m = (*m * inv).max(0.0);
+        }
+        self.markers.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        self.speed = (self.speed * ratio).clamp(0.1, 4.0);
+        let last = (self.duration() - MIN_CLIP).max(0.0);
+        if let Some(m) = &mut self.start_marker {
+            *m = m.min(last);
+        }
+        ratio
+    }
+
     /// Append a clip to a layer, directly after everything already on it.
     #[allow(dead_code)]
     pub fn push_clip(&mut self, layer: usize, mut clip: Clip) -> bool {
@@ -746,6 +813,7 @@ impl Project {
         if self.fps == 0 {
             self.fps = 30;
         }
+        self.speed = self.speed.clamp(0.1, 4.0);
         let mut max_id = 0;
         // Version 1 stored a single transform per layer; copy it onto every
         // section so older projects keep looking the same after upgrading.
@@ -1322,6 +1390,53 @@ mod tests {
         p.trim_left(1, 1.0, MIN_CLIP);
         assert!((p.layers[0].clips[0].in_point - 4.0).abs() < 1e-9);
         assert!((p.layers[0].clips[0].duration - 5.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn global_speed_retimes_the_whole_timeline() {
+        let mut p = Project::new();
+        let mut a = clip(1, 4.0);
+        a.keyframes.push(Keyframe { time: 2.0, transform: Transform::default() });
+        p.push_clip(0, a);
+        let mut b = clip(2, 2.0);
+        b.start = 6.0;
+        p.layers[0].clips.push(b);
+        p.markers.push(5.0);
+        p.start_marker = Some(1.0);
+        assert!((p.duration() - 8.0).abs() < 1e-9);
+
+        // 2x: everything is half as long and plays twice as fast.
+        let ratio = p.set_global_speed(2.0);
+        assert!((ratio - 2.0).abs() < 1e-9);
+        let l = &p.layers[0];
+        assert!((l.clips[0].duration - 2.0).abs() < 1e-9);
+        assert!((l.clips[0].speed - 2.0).abs() < 1e-9);
+        assert!((l.clips[1].start - 3.0).abs() < 1e-9);
+        assert!((l.clips[1].duration - 1.0).abs() < 1e-9);
+        assert!((l.clips[0].keyframes[0].time - 1.0).abs() < 1e-9);
+        assert!((p.markers[0] - 2.5).abs() < 1e-9);
+        assert!((p.start_marker.unwrap() - 0.5).abs() < 1e-9);
+        assert!((p.duration() - 4.0).abs() < 1e-9);
+        assert!((p.speed - 2.0).abs() < 1e-9);
+
+        // Back to normal restores the original arrangement.
+        assert!((p.set_global_speed(1.0) - 0.5).abs() < 1e-9);
+        assert!((p.duration() - 8.0).abs() < 1e-9);
+        assert!((p.layers[0].clips[0].speed - 1.0).abs() < 1e-9);
+        assert!((p.speed - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn global_speed_never_pushes_sections_out_of_range() {
+        let mut p = Project::new();
+        let mut c = clip(1, 4.0);
+        c.speed = 6.0;
+        p.push_clip(0, c);
+        // 4x would need a 24x section speed, so the retime stops at 8x.
+        let ratio = p.set_global_speed(4.0);
+        assert!((ratio - (8.0 / 6.0)).abs() < 1e-9);
+        assert!((p.layers[0].clips[0].speed - 8.0).abs() < 1e-9);
+        assert!((p.speed - (8.0 / 6.0)).abs() < 1e-9);
     }
 
     #[test]

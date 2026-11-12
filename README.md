@@ -20,7 +20,7 @@ codec can never take the application down with it.
 | **Per-section transform** | Every section stores its own X/Y/scale/opacity, so clips on one track can sit in different corners |
 | **Keyframed transforms** | Animate X/Y/scale/opacity inside one section; keys are interpolated linearly |
 | **Text sections** | Generated titles/captions with content, size, bold, colour and an optional box |
-| **Speed control** | Per-section 0.1x–4x with presets; video and audio stay in sync |
+| **Speed control** | Per-section 0.05x–8x and a whole-project playback speed; video and audio stay in sync |
 | **Audio controls** | Per-section volume, fade in/out, track mute/solo, and a limiter that stops clipping/pops |
 | **Edge trimming** | Drag a section's left or right edge in the timeline to trim it |
 | **Colour & effects** | Per-section brightness, contrast, saturation, blur, flip, rotation, crop, pixelate, sharpen and vignette |
@@ -159,11 +159,20 @@ Press **F1** or click **Help** in the toolbar for an in-app shortcut sheet.
 
 ### Speed, audio and pops
 
-Each section has a speed slider (0.1x–4x, with 0.25/0.5/1/1.5/2/4 presets) and,
-for video with audio, a volume slider plus fade-in/fade-out. Fades already in
-progress at the seek point resume at the right alpha rather than restarting, and
-every audio mix passes through `alimiter=limit=0.95`, so sections cut mid-waveform
-don't click or clip.
+Each section has its own playback speed (0.05x–8x, with 0.25/0.5/0.75/1/1.15/1.25/1.5/2/4
+presets) in the **Section** tab. Changing a section's speed keeps its slot on the
+timeline: at 2x it consumes twice as much source inside the same length (limited by
+available source), and at 0.5x it stretches the source. The **Project** tab also has
+a **Playback speed** control (0.1x–4x, same presets) that retimes the *whole*
+timeline — sections, starts, gaps, keyframes, markers and fades all scale, while each
+section's speed is multiplied so no source frames are lost. Set it back to 1x (or
+undo) to restore the original arrangement.
+
+Speed changes also affect audio: RunVideo chains `atempo` stages so any rate in the
+editor's range keeps sync and pitch-corrected tempo. Every section also has a volume
+slider plus fade-in/fade-out. Fades already in progress at the seek point resume at
+the right alpha rather than restarting, and every audio mix passes through
+`alimiter=limit=0.95`, so sections cut mid-waveform don't click or clip.
 
 
 ### Editing directly in the preview

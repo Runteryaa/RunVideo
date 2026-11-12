@@ -328,6 +328,29 @@ impl RunVideoApp {
         self.redo.clear();
     }
 
+    /// Retime the whole timeline so it plays at `target`x (1.0 = normal).
+    fn apply_project_speed(&mut self, target: f64) {
+        if (target - self.project.speed).abs() < 1e-9 {
+            return;
+        }
+        self.snapshot();
+        let ratio = self.project.set_global_speed(target);
+        if (ratio - 1.0).abs() < 1e-9 {
+            self.undo.pop();
+            return;
+        }
+        self.position = self.position.min(self.project.duration());
+        self.after_edit();
+        self.set_status(
+            format!(
+                "Project speed {:.2}x  -  timeline is now {}.",
+                self.project.speed,
+                fmt_time(self.project.duration())
+            ),
+            false,
+        );
+    }
+
     fn after_edit(&mut self) {
         self.revision = self.revision.wrapping_add(1);
         self.dirty = true;
@@ -3332,19 +3355,26 @@ impl RunVideoApp {
             ui.horizontal(|ui| {
                 ui.label("Speed");
                 let mut speed = clip.speed;
-                let resp = ui.add(
-                    egui::DragValue::new(&mut speed)
-                        .range(0.1..=4.0)
-                        .speed(0.01)
-                        .suffix("x"),
-                );
+                let resp = ui
+                    .add(
+                        egui::DragValue::new(&mut speed)
+                            .range(0.05..=8.0)
+                            .speed(0.01)
+                            .suffix("x"),
+                    )
+                    .on_hover_text(
+                        "Playback rate of this section. 2x uses twice as much source in the same length (clamped to the source available).",
+                    );
                 if resp.changed() {
-                    clip.speed = speed.clamp(0.1, 4.0);
+                    clip.speed = speed.clamp(0.05, 8.0);
                     changed = true;
                 }
-                for preset in [0.25f64, 0.5, 1.0, 1.5, 2.0, 4.0] {
+            });
+            ui.horizontal_wrapped(|ui| {
+                for preset in [0.25f64, 0.5, 0.75, 1.0, 1.15, 1.25, 1.5, 2.0, 4.0] {
                     if ui
                         .add(egui::Button::new(format!("{preset}x")).small())
+                        .on_hover_text("Set this section's playback speed")
                         .clicked()
                     {
                         clip.speed = preset;
@@ -3884,6 +3914,50 @@ impl RunVideoApp {
             .small()
             .weak(),
         );
+        ui.separator();
+        ui.label(RichText::new("Playback speed (whole project)").strong());
+        let mut apply_speed: Option<f64> = None;
+        ui.horizontal(|ui| {
+            ui.label("Speed");
+            let mut speed = self.project.speed;
+            let resp = ui
+                .add(
+                    egui::DragValue::new(&mut speed)
+                        .range(0.1..=4.0)
+                        .speed(0.01)
+                        .suffix("x"),
+                )
+                .on_hover_text(
+                    "Retimes every section and the whole timeline. 2x makes the project twice as fast.",
+                );
+            // Commit once the drag/typing finishes instead of on every pixel.
+            if resp.drag_stopped() || (resp.lost_focus() && resp.changed()) {
+                apply_speed = Some(speed);
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
+            for preset in [0.5f64, 0.75, 1.0, 1.15, 1.25, 1.5, 2.0, 4.0] {
+                if ui
+                    .add(egui::Button::new(format!("{preset}x")).small())
+                    .on_hover_text("Retime the whole project")
+                    .clicked()
+                {
+                    apply_speed = Some(preset);
+                }
+            }
+        });
+        if let Some(target) = apply_speed {
+            self.apply_project_speed(target);
+        }
+        ui.label(
+            RichText::new(format!(
+                "Timeline length {}. Each section can still have its own speed in the Section tab.",
+                fmt_time(self.project.duration())
+            ))
+            .small()
+            .weak(),
+        );
+        ui.separator();
         ui.horizontal(|ui| {
             ui.label("Export speed");
             let mut selected: Option<&'static str> = None;

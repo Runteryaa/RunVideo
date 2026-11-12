@@ -848,6 +848,28 @@ pub fn build_preview_plan(project: &Project, start: f64, width: u32, height: u32
     })
 }
 
+/// `atempo` filter chain for any playback rate in the editor's 0.05–8× range.
+fn atempo_chain(speed: f64) -> String {
+    let mut s = speed.clamp(0.05, 8.0);
+    let mut parts: Vec<String> = Vec::new();
+    while s > 2.0 + 1e-9 {
+        parts.push("atempo=2.000000".to_owned());
+        s /= 2.0;
+    }
+    while s < 0.5 - 1e-9 {
+        parts.push("atempo=0.500000".to_owned());
+        s /= 0.5;
+    }
+    if (s - 1.0).abs() > 1e-6 {
+        parts.push(format!("atempo={s:.6}"));
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!("{},", parts.join(","))
+    }
+}
+
 fn build_audio_filters(graph: &BuiltGraph, duration: f64) -> Option<(Vec<String>, String)> {
     let any_audio = graph
         .layers
@@ -870,12 +892,9 @@ fn build_audio_filters(graph: &BuiltGraph, duration: f64) -> Option<(Vec<String>
             let label = format!("a{}_{}", layer.index, si);
             if clip.is_video && clip.has_audio {
                 // Speed changes pitch-shift via atempo; the source is consumed at
-                // `speed`× the timeline rate.
-                let tempo = if (clip.speed - 1.0).abs() > 1e-6 {
-                    format!("atempo={:.6},", clip.speed.clamp(0.5, 2.0))
-                } else {
-                    String::new()
-                };
+                // `speed`× the timeline rate. A single atempo only accepts
+                // 0.5–2.0, so larger/smaller factors are chained.
+                let tempo = atempo_chain(clip.speed);
                 // Trim to the timeline duration after the speed change, so the
                 // audio segment matches its video segment exactly.
                 filters.push(format!(
@@ -1236,6 +1255,21 @@ mod tests {
         assert!(
             !joined.contains("geq="),
             "in-progress fades must not use geq: {joined}"
+        );
+    }
+
+    #[test]
+    fn audio_speed_filter_supports_the_whole_range() {
+        assert_eq!(atempo_chain(1.0), "");
+        assert_eq!(atempo_chain(1.5), "atempo=1.500000,");
+        // Single atempo only accepts 0.5-2.0, so bigger factors are chained.
+        assert_eq!(
+            atempo_chain(4.0),
+            "atempo=2.000000,atempo=2.000000,"
+        );
+        assert_eq!(
+            atempo_chain(0.25),
+            "atempo=0.500000,atempo=0.500000,"
         );
     }
 
