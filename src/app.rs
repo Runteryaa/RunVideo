@@ -18,21 +18,352 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// Brand accent. Kept orange, but used sparingly (primary action, selection).
 const ACCENT: Color32 = Color32::from_rgb(255, 166, 48);
-const ACCENT_DIM: Color32 = Color32::from_rgb(105, 72, 24);
+const ACCENT_HOVER: Color32 = Color32::from_rgb(255, 186, 96);
+const ACCENT_DIM: Color32 = Color32::from_rgb(96, 68, 26);
 /// Width of the track header column (name + visibility toggle).
-const ROW_HEADER: f32 = 156.0;
-const RULER_H: f32 = 26.0;
-const VIDEO_BG: Color32 = Color32::from_rgb(42, 96, 116);
-const VIDEO_BG_HOVER: Color32 = Color32::from_rgb(54, 118, 141);
-const IMAGE_BG: Color32 = Color32::from_rgb(116, 86, 38);
-const TEXT_BG: Color32 = Color32::from_rgb(88, 60, 116);
-const OK_COLOR: Color32 = Color32::from_rgb(122, 205, 140);
-const ERR_COLOR: Color32 = Color32::from_rgb(240, 112, 112);
-const PANEL_BG: Color32 = Color32::from_rgb(24, 24, 28);
-const ROW_BG: Color32 = Color32::from_rgb(31, 31, 37);
-const ROW_BG_ALT: Color32 = Color32::from_rgb(27, 27, 32);
-const ROW_BG_SELECTED: Color32 = Color32::from_rgb(42, 38, 29);
+const ROW_HEADER: f32 = 162.0;
+const RULER_H: f32 = 28.0;
+// Clip colours: slightly desaturated, so text stays readable and the accent
+// selection ring pops.
+const VIDEO_BG: Color32 = Color32::from_rgb(45, 94, 116);
+const VIDEO_BG_HOVER: Color32 = Color32::from_rgb(58, 118, 143);
+const IMAGE_BG: Color32 = Color32::from_rgb(108, 82, 44);
+const TEXT_BG: Color32 = Color32::from_rgb(84, 62, 112);
+const OK_COLOR: Color32 = Color32::from_rgb(120, 209, 146);
+const ERR_COLOR: Color32 = Color32::from_rgb(240, 116, 116);
+// Surfaces, darkest to lightest.
+const BG_DEEP: Color32 = Color32::from_rgb(13, 14, 17);
+const PANEL_BG: Color32 = Color32::from_rgb(22, 23, 28);
+const SURFACE: Color32 = Color32::from_rgb(30, 32, 39);
+const SURFACE_HI: Color32 = Color32::from_rgb(39, 42, 51);
+const BORDER: Color32 = Color32::from_rgb(45, 48, 58);
+const TEXT: Color32 = Color32::from_rgb(228, 231, 238);
+const TEXT_DIM: Color32 = Color32::from_rgb(148, 154, 168);
+const ROW_BG: Color32 = Color32::from_rgb(27, 29, 35);
+const ROW_BG_ALT: Color32 = Color32::from_rgb(23, 25, 30);
+const HAIRLINE: Color32 = Color32::from_rgb(40, 43, 52);
+
+/// Install the app-wide look: rounded, layered dark surfaces with a single
+/// orange accent, generous padding and a readable type scale.
+fn apply_theme(ctx: &egui::Context) {
+    use egui::{FontFamily, FontId, TextStyle};
+
+    ctx.set_theme(egui::ThemePreference::Dark);
+    ctx.style_mut_of(egui::Theme::Dark, |style| {
+        let mut v = egui::Visuals::dark();
+
+        v.panel_fill = PANEL_BG;
+        v.window_fill = Color32::from_rgb(26, 27, 33);
+        v.window_stroke = Stroke::new(1.0, BORDER);
+        v.window_corner_radius = egui::CornerRadius::same(12);
+        v.menu_corner_radius = egui::CornerRadius::same(10);
+        v.window_shadow = egui::epaint::Shadow {
+            offset: [0, 12],
+            blur: 32,
+            spread: 0,
+            color: Color32::from_black_alpha(140),
+        };
+        v.popup_shadow = egui::epaint::Shadow {
+            offset: [0, 6],
+            blur: 18,
+            spread: 0,
+            color: Color32::from_black_alpha(120),
+        };
+        v.extreme_bg_color = BG_DEEP;
+        v.faint_bg_color = Color32::from_rgb(28, 30, 36);
+        v.text_cursor.stroke = Stroke::new(2.0, ACCENT);
+        v.selection.bg_fill = ACCENT_DIM;
+        v.selection.stroke = Stroke::new(1.0, ACCENT);
+        v.hyperlink_color = ACCENT;
+        v.slider_trailing_fill = true;
+        v.striped = true;
+
+        // Buttons/inputs: soft raised surfaces instead of flat grey boxes.
+        let w = &mut v.widgets;
+        w.noninteractive.bg_fill = PANEL_BG;
+        w.noninteractive.weak_bg_fill = PANEL_BG;
+        w.noninteractive.bg_stroke = Stroke::new(1.0, HAIRLINE);
+        w.noninteractive.fg_stroke = Stroke::new(1.0, TEXT_DIM);
+        w.noninteractive.corner_radius = egui::CornerRadius::same(8);
+
+        w.inactive.bg_fill = SURFACE;
+        w.inactive.weak_bg_fill = SURFACE;
+        w.inactive.bg_stroke = Stroke::new(1.0, BORDER);
+        w.inactive.fg_stroke = Stroke::new(1.0, TEXT);
+        w.inactive.corner_radius = egui::CornerRadius::same(8);
+
+        w.hovered.bg_fill = SURFACE_HI;
+        w.hovered.weak_bg_fill = SURFACE_HI;
+        w.hovered.bg_stroke = Stroke::new(1.0, Color32::from_rgb(78, 84, 99));
+        w.hovered.fg_stroke = Stroke::new(1.0, Color32::WHITE);
+        w.hovered.corner_radius = egui::CornerRadius::same(8);
+
+        w.active.bg_fill = ACCENT_DIM;
+        w.active.weak_bg_fill = ACCENT_DIM;
+        w.active.bg_stroke = Stroke::new(1.0, ACCENT);
+        w.active.fg_stroke = Stroke::new(1.0, Color32::WHITE);
+        w.active.corner_radius = egui::CornerRadius::same(8);
+
+        w.open.bg_fill = SURFACE;
+        w.open.weak_bg_fill = SURFACE;
+        w.open.bg_stroke = Stroke::new(1.0, BORDER);
+        w.open.fg_stroke = Stroke::new(1.0, TEXT);
+        w.open.corner_radius = egui::CornerRadius::same(8);
+
+        style.visuals = v;
+
+        let s = &mut style.spacing;
+        s.item_spacing = egui::vec2(8.0, 7.0);
+        s.button_padding = egui::vec2(10.0, 5.0);
+        s.interact_size = egui::vec2(34.0, 26.0);
+        s.slider_width = 150.0;
+        s.combo_width = 150.0;
+        s.indent = 16.0;
+        s.scroll = egui::style::ScrollStyle::solid();
+        s.scroll.bar_width = 8.0;
+        s.scroll.floating = true;
+        s.scroll.bar_inner_margin = 3.0;
+        s.menu_margin = egui::Margin::same(6);
+        s.window_margin = egui::Margin::same(12);
+
+        style.text_styles = [
+            (TextStyle::Heading, FontId::proportional(19.0)),
+            (TextStyle::Body, FontId::proportional(13.5)),
+            (TextStyle::Button, FontId::proportional(13.5)),
+            (TextStyle::Small, FontId::proportional(11.5)),
+            (
+                TextStyle::Monospace,
+                FontId::new(13.0, FontFamily::Monospace),
+            ),
+        ]
+        .into();
+        style.animation_time = 0.12;
+    });
+}
+
+/// Segmented tab bar used at the top of the right panel.
+fn tab_strip(ui: &mut egui::Ui, current: &mut PanelTab) {
+    // Compute the segment width from the panel before entering the frame, so a
+    // wider-than-expected child can never push the strip off screen.
+    let outer = ui.available_width().max(120.0);
+    let width = ((outer - 12.0) / 3.0).floor().max(40.0);
+    let mut clicked_tab = None;
+    egui::Frame::new()
+        .fill(BG_DEEP)
+        .stroke(Stroke::new(1.0, HAIRLINE))
+        .corner_radius(egui::CornerRadius::same(10))
+        .inner_margin(egui::Margin::same(3))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 3.0;
+                for (tab, label) in [
+                    (PanelTab::Section, "Section"),
+                    (PanelTab::Layer, "Layer"),
+                    (PanelTab::Project, "Project"),
+                ] {
+                    let selected = *current == tab;
+                    let button = egui::Button::new(
+                        RichText::new(label)
+                            .color(if selected { Color32::WHITE } else { TEXT_DIM })
+                            .strong(),
+                    )
+                    .fill(if selected { SURFACE_HI } else { Color32::TRANSPARENT })
+                    .stroke(if selected {
+                        Stroke::new(1.0, ACCENT)
+                    } else {
+                        Stroke::NONE
+                    })
+                    .corner_radius(egui::CornerRadius::same(8))
+                    .min_size(egui::vec2(width, 27.0));
+                    if ui.add(button).clicked() {
+                        clicked_tab = Some(tab);
+                    }
+                }
+            });
+        });
+    if let Some(tab) = clicked_tab {
+        *current = tab;
+    }
+}
+
+/// A horizontal, rounded container used to group toolbar buttons.
+fn toolbar_group(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
+    egui::Frame::new()
+        .fill(PANEL_BG)
+        .stroke(Stroke::new(1.0, HAIRLINE))
+        .corner_radius(egui::CornerRadius::same(9))
+        .inner_margin(egui::Margin::symmetric(5, 2))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                add(ui);
+            });
+        });
+}
+
+/// Small uppercase label used to title a group of controls in the side panel.
+fn section_label(ui: &mut egui::Ui, text: &str) {
+    ui.add_space(4.0);
+    ui.label(
+        RichText::new(text.to_uppercase())
+            .size(10.5)
+            .strong()
+            .color(TEXT_DIM),
+    );
+    ui.add_space(2.0);
+}
+
+/// A rounded card that groups related controls.
+fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    egui::Frame::new()
+        .fill(SURFACE)
+        .stroke(Stroke::new(1.0, BORDER))
+        .corner_radius(egui::CornerRadius::same(10))
+        .inner_margin(egui::Margin::symmetric(10, 8))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            add(ui)
+        })
+        .inner
+}
+
+/// Rounded "pill" used for status text and timecodes.
+fn pill(
+    ui: &mut egui::Ui,
+    text: &str,
+    size: f32,
+    color: Color32,
+    fill: Color32,
+) -> egui::Response {
+    let galley = ui.painter().layout_no_wrap(
+        text.to_owned(),
+        egui::FontId::proportional(size),
+        color,
+    );
+    let box_size = galley.size() + egui::vec2(18.0, 9.0);
+    let (rect, resp) = ui.allocate_exact_size(box_size, Sense::hover());
+    ui.painter()
+        .rect_filled(rect, egui::CornerRadius::same(7), fill);
+    ui.painter()
+        .galley(rect.center() - galley.size() / 2.0, galley, color);
+    resp
+}
+
+/// Icon painted inside a transport button. The bundled fonts have no reliable
+/// media-control glyphs (they render as tofu boxes), so we draw them.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Icon {
+    Play,
+    Pause,
+    Stop,
+}
+
+/// Media-control button: optional accent fill, a painted icon and a label.
+fn icon_button(
+    ui: &mut egui::Ui,
+    icon: Icon,
+    label: &str,
+    accent: bool,
+    width: f32,
+) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(width, 30.0), Sense::click());
+    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+    let hovered = resp.hovered();
+    let (fill, stroke, fg) = if accent {
+        (
+            if hovered { ACCENT_HOVER } else { ACCENT },
+            Stroke::NONE,
+            Color32::from_rgb(28, 20, 8),
+        )
+    } else if hovered {
+        (
+            SURFACE_HI,
+            Stroke::new(1.0, Color32::from_rgb(78, 84, 99)),
+            Color32::WHITE,
+        )
+    } else {
+        (SURFACE, Stroke::new(1.0, BORDER), TEXT)
+    };
+
+    let painter = ui.painter();
+    painter.rect_filled(rect, egui::CornerRadius::same(9), fill);
+    if stroke != Stroke::NONE {
+        painter.rect_stroke(
+            rect,
+            egui::CornerRadius::same(9),
+            stroke,
+            StrokeKind::Inside,
+        );
+    }
+
+    let font = egui::FontId::proportional(13.5);
+    let galley = painter.layout_no_wrap(label.to_owned(), font, fg);
+    let icon_w = 11.0;
+    let gap = if label.is_empty() { 0.0 } else { 7.0 };
+    let total = icon_w + gap + galley.size().x;
+    let left = rect.center().x - total / 2.0;
+    let cy = rect.center().y;
+    let ix = left + icon_w / 2.0;
+    match icon {
+        Icon::Play => {
+            painter.add(Shape::convex_polygon(
+                vec![
+                    egui::pos2(ix - 3.5, cy - 5.0),
+                    egui::pos2(ix + 5.0, cy),
+                    egui::pos2(ix - 3.5, cy + 5.0),
+                ],
+                fg,
+                Stroke::NONE,
+            ));
+        }
+        Icon::Pause => {
+            painter.rect_filled(
+                Rect::from_min_size(egui::pos2(ix - 4.0, cy - 5.0), egui::vec2(3.0, 10.0)),
+                1.0,
+                fg,
+            );
+            painter.rect_filled(
+                Rect::from_min_size(egui::pos2(ix + 1.0, cy - 5.0), egui::vec2(3.0, 10.0)),
+                1.0,
+                fg,
+            );
+        }
+        Icon::Stop => {
+            painter.rect_filled(
+                Rect::from_min_size(egui::pos2(ix - 4.0, cy - 4.0), egui::vec2(8.0, 8.0)),
+                1.5,
+                fg,
+            );
+        }
+    }
+    painter.galley(
+        egui::pos2(left + icon_w + gap, cy - galley.size().y / 2.0),
+        galley,
+        fg,
+    );
+    resp
+}
+
+/// A drawn check mark inside a coloured disc (export finished badge).
+fn check_badge(ui: &mut egui::Ui, diameter: f32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(diameter, diameter), Sense::hover());
+    let painter = ui.painter();
+    painter.circle_filled(rect.center(), diameter / 2.0, Color32::from_rgb(28, 48, 34));
+    let c = rect.center();
+    let s = diameter * 0.24;
+    let stroke = Stroke::new(2.0, OK_COLOR);
+    painter.line_segment(
+        [egui::pos2(c.x - s, c.y + 0.5), egui::pos2(c.x - s * 0.2, c.y + s)],
+        stroke,
+    );
+    painter.line_segment(
+        [egui::pos2(c.x - s * 0.2, c.y + s), egui::pos2(c.x + s, c.y - s)],
+        stroke,
+    );
+}
+
 
 struct Status {
     text: String,
@@ -219,17 +550,7 @@ impl RunVideoApp {
         cc: &eframe::CreationContext<'_>,
         open: Option<PathBuf>,
     ) -> Self {
-        let mut visuals = egui::Visuals::dark();
-        visuals.panel_fill = PANEL_BG;
-        visuals.window_fill = Color32::from_rgb(29, 29, 34);
-        visuals.selection.bg_fill = ACCENT_DIM;
-        visuals.selection.stroke = Stroke::new(1.0, ACCENT);
-        visuals.widgets.hovered.bg_fill = Color32::from_rgb(48, 48, 56);
-        visuals.widgets.active.bg_fill = Color32::from_rgb(60, 54, 40);
-        cc.egui_ctx.set_visuals(visuals);
-        cc.egui_ctx.all_styles_mut(|style| {
-            style.spacing.item_spacing = egui::vec2(8.0, 6.0);
-        });
+        apply_theme(&cc.egui_ctx);
 
         let ffmpeg_version = ffmpeg::ffmpeg_version();
         let (wave_tx, wave_rx) = channel();
@@ -2084,96 +2405,116 @@ impl RunVideoApp {
     fn top_bar(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         egui::Panel::top("top_bar")
-            .frame(egui::Frame::new().fill(PANEL_BG).inner_margin(egui::Margin::symmetric(10, 6)))
+            .frame(
+                egui::Frame::new()
+                    .fill(BG_DEEP)
+                    .inner_margin(egui::Margin::symmetric(12, 8)),
+            )
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("RunVideo").strong().size(18.0).color(ACCENT));
-                    ui.separator();
+                    // Brand mark: accent dot + wordmark.
+                    let (dot, _) = ui.allocate_exact_size(egui::vec2(10.0, 18.0), Sense::hover());
+                    ui.painter().circle_filled(
+                        dot.center(),
+                        4.0,
+                        ACCENT,
+                    );
+                    ui.label(RichText::new("RunVideo").strong().size(17.0).color(TEXT));
+                    ui.add_space(2.0);
 
-                    if ui.button("New").on_hover_text("New project (Ctrl+N)").clicked() {
-                        self.new_project(&ctx);
-                    }
-                    if ui.button("Open").on_hover_text("Open project (Ctrl+O)").clicked() {
-                        self.open_project(&ctx);
-                    }
-                    if ui.button("Save").on_hover_text("Save project (Ctrl+S)").clicked() {
-                        self.save_project(&ctx, false);
-                    }
-                    if ui.button("Save As").clicked() {
-                        self.save_project(&ctx, true);
-                    }
+                    // Grouped toolbar surfaces: separate rounded "cards" keep the
+                    // row from reading as one long undifferentiated strip.
+                    toolbar_group(ui, |ui| {
+                        for (label, hint) in [
+                            ("New", "New project (Ctrl+N)"),
+                            ("Open", "Open project (Ctrl+O)"),
+                            ("Save", "Save project (Ctrl+S)"),
+                            ("Save As", ""),
+                            ("Help", "Shortcuts and help (F1)"),
+                        ] {
+                            if ui.button(label).on_hover_text(hint).clicked() {
+                                match label {
+                                    "New" => self.new_project(&ctx),
+                                    "Open" => self.open_project(&ctx),
+                                    "Save" => self.save_project(&ctx, false),
+                                    "Save As" => self.save_project(&ctx, true),
+                                    _ => self.show_help = true,
+                                }
+                            }
+                        }
+                    });
+                    toolbar_group(ui, |ui| {
+                        if ui
+                            .add_enabled(
+                                self.ffmpeg_version.is_some() && self.project.total_clips() > 0,
+                                egui::Button::new("Capture"),
+                            )
+                            .on_hover_text("Save the frame at the playhead as a PNG")
+                            .clicked()
+                        {
+                            self.capture_current_frame();
+                        }
+                        if ui
+                            .button(if self.fullscreen { "Windowed" } else { "Fullscreen" })
+                            .on_hover_text("Toggle fullscreen preview (F11)")
+                            .clicked()
+                        {
+                            self.toggle_fullscreen(&ctx);
+                        }
+                    });
+                    toolbar_group(ui, |ui| {
+                        if ui
+                            .add_enabled(
+                                self.ffmpeg_version.is_some(),
+                                egui::Button::new("+  Add Media"),
+                            )
+                            .on_hover_text(format!(
+                                "Add video or photos to the selected track ({}). Drop files on a track row to target that track.",
+                                self.project.layers[self
+                                    .selected_layer
+                                    .min(self.project.layers.len() - 1)]
+                                .name
+                            ))
+                            .clicked()
+                        {
+                            self.add_media_dialog(&ctx);
+                        }
+                    });
+                    toolbar_group(ui, |ui| {
+                        if ui
+                            .add_enabled(!self.undo.is_empty(), egui::Button::new("Undo"))
+                            .on_hover_text("Undo (Ctrl+Z)")
+                            .clicked()
+                        {
+                            self.undo(&ctx);
+                        }
+                        if ui
+                            .add_enabled(!self.redo.is_empty(), egui::Button::new("Redo"))
+                            .on_hover_text("Redo (Ctrl+Y)")
+                            .clicked()
+                        {
+                            self.redo(&ctx);
+                        }
+                    });
                     if ui
-                        .button("Help")
-                        .on_hover_text("Shortcuts and help (F1)")
-                        .clicked()
-                    {
-                        self.show_help = true;
-                    }
-                    if ui
-                        .add_enabled(
-                            self.ffmpeg_version.is_some() && self.project.total_clips() > 0,
-                            egui::Button::new("Capture"),
-                        )
-                        .on_hover_text("Save the frame at the playhead as a PNG")
-                        .clicked()
-                    {
-                        self.capture_current_frame();
-                    }
-                    if ui
-                        .button(if self.fullscreen { "Windowed" } else { "Fullscreen" })
-                        .on_hover_text("Toggle fullscreen preview (F11)")
-                        .clicked()
-                    {
-                        self.toggle_fullscreen(&ctx);
-                    }
-                    ui.separator();
-                    if ui
-                        .add_enabled(
-                            self.ffmpeg_version.is_some(),
-                            egui::Button::new("+ Add Media"),
-                        )
-                        .on_hover_text(format!(
-                            "Add video or photos to the selected track ({}). Drop files on a track row to target that track.",
-                            self.project.layers[self
-                                .selected_layer
-                                .min(self.project.layers.len() - 1)]
-                            .name
-                        ))
-                        .clicked()
-                    {
-                        self.add_media_dialog(&ctx);
-                    }
-                    ui.separator();
-                    if ui
-                        .add_enabled(!self.undo.is_empty(), egui::Button::new("Undo"))
-                        .on_hover_text("Undo (Ctrl+Z)")
-                        .clicked()
-                    {
-                        self.undo(&ctx);
-                    }
-                    if ui
-                        .add_enabled(!self.redo.is_empty(), egui::Button::new("Redo"))
-                        .on_hover_text("Redo (Ctrl+Y)")
-                        .clicked()
-                    {
-                        self.redo(&ctx);
-                    }
-
-                    ui.separator();
-
-		    if ui
                         .add_enabled(
                             self.ffmpeg_version.is_some() && self.project.duration() > 0.0,
-                            egui::Button::new("Export"),
+                            egui::Button::new(
+                                RichText::new("Export").strong().color(Color32::from_rgb(28, 20, 8)),
+                            )
+                            .fill(ACCENT)
+                            .stroke(Stroke::NONE)
+                            .corner_radius(egui::CornerRadius::same(9))
+                            .min_size(egui::vec2(84.0, 26.0)),
                         )
-                        .on_hover_text("Export MP4 (Ctrl+E)")
+                        .on_hover_text("Export video (Ctrl+E)")
                         .clicked()
                     {
                         self.export_dialog();
                     }
 
                     let title = format!(
-                        "{}  -  {}x{} @ {} fps  -  {} / {}",
+                        "{}  ·  {}×{}  ·  {} fps  ·  {} / {} sections",
                         self.project.name,
                         self.project.width,
                         self.project.height,
@@ -2181,38 +2522,66 @@ impl RunVideoApp {
                         self.project.total_clips(),
                         MAX_CLIPS
                     );
-                    ui.add(egui::Label::new(RichText::new(title).small().weak()).truncate());
 
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        match &self.ffmpeg_version {
-                            Some(v) => {
-                                ui.label(RichText::new("FFmpeg ready").weak().size(11.0))
-                                    .on_hover_text(v.clone());
+                    // One right-aligned cluster, only when the bar has room left.
+                    // (At narrow widths egui would otherwise draw it over the
+                    // toolbar, since a right-to-left layout starts at the cursor.)
+                    let remaining = ui.available_width();
+                    if remaining > 250.0 {
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ui.available_width() > 110.0 {
+                                match &self.ffmpeg_version {
+                                    Some(v) => {
+                                        pill(
+                                            ui,
+                                            "FFmpeg ready",
+                                            10.5,
+                                            OK_COLOR,
+                                            Color32::from_rgba_unmultiplied(60, 120, 80, 40),
+                                        )
+                                        .on_hover_text(v.clone());
+                                    }
+                                    None => {
+                                        pill(
+                                            ui,
+                                            "FFmpeg missing",
+                                            10.5,
+                                            ERR_COLOR,
+                                            Color32::from_rgba_unmultiplied(150, 60, 60, 45),
+                                        );
+                                    }
+                                }
                             }
-                            None => {
-                                ui.label(
-                                    RichText::new("FFmpeg missing")
-                                        .color(ERR_COLOR)
-                                        .strong()
-                                        .size(12.0),
+                            if let Some(status) = &self.status {
+                                let text = truncate(&status.text, 40);
+                                let color = if status.error { ERR_COLOR } else { TEXT_DIM };
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(text).small().color(color),
+                                    )
+                                    .truncate(),
+                                )
+                                .on_hover_text(&status.text);
+                            }
+                            if ui.available_width() > 210.0 {
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(title).small().color(TEXT_DIM),
+                                    )
+                                    .truncate(),
                                 );
                             }
-                        }
-                        if let Some(status) = &self.status {
-                            ui.separator();
-
-                            let text = truncate(&status.text, 56);
-                            ui.add(
-                                egui::Label::new(
-                                    RichText::new(text)
-                                        .small()
-                                        .color(if status.error { ERR_COLOR } else { OK_COLOR }),
-                                )
-                                .truncate(),
+                        });
+                    } else if remaining > 90.0 {
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(truncate(&self.project.name, 24))
+                                    .small()
+                                    .color(TEXT_DIM),
                             )
-                            .on_hover_text(&status.text);
-                        }
-                    });
+                            .truncate(),
+                        );
+                    }
                 });
             });
     }
@@ -2224,8 +2593,8 @@ impl RunVideoApp {
     fn timeline_panel(&mut self, ui: &mut egui::Ui) {
         egui::Panel::bottom("timeline")
             .resizable(true)
-            .default_size(340.0)
-            .frame(egui::Frame::new().fill(PANEL_BG).inner_margin(egui::Margin::symmetric(8, 6)))
+            .default_size(320.0)
+            .frame(egui::Frame::new().fill(PANEL_BG).inner_margin(egui::Margin::symmetric(10, 8)))
             .show(ui, |ui| {
                 self.timeline_ui(ui);
             });
@@ -2233,70 +2602,69 @@ impl RunVideoApp {
 
     fn timeline_ui(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.strong("Timeline");
-            ui.separator();
-            ui.label(RichText::new("Zoom").small().weak());
+            ui.label(RichText::new("Timeline").strong().size(14.0));
+            ui.add_space(2.0);
+            pill(
+                ui,
+                &format!(
+                    "{} sections  ·  {}",
+                    self.project.total_clips(),
+                    fmt_time(self.project.duration())
+                ),
+                10.5,
+                TEXT_DIM,
+                Color32::from_rgb(30, 32, 39),
+            );
+            ui.add_space(6.0);
+            ui.label(RichText::new("Zoom").small().color(TEXT_DIM));
             ui.add(
                 egui::Slider::new(&mut self.pps, 8.0..=300.0)
                     .logarithmic(true)
                     .show_value(false),
             )
             .on_hover_text("Timeline zoom");
-            ui.separator();
-            if ui
-                .add_enabled(
-                    self.project.layers.len() < MAX_LAYERS,
-                    egui::Button::new("+ Track"),
-                )
-                .on_hover_text("Add another video track (L)")
-                .clicked()
-            {
-                self.add_overlay_layer();
-            }
-            ui.separator();
-            if ui
-                .add_enabled(
-                    self.project.total_clips() < MAX_CLIPS,
-                    egui::Button::new("+ Text"),
-                )
-                .on_hover_text("Insert a title/caption section at the playhead")
-                .clicked()
-            {
-                self.add_text_section(ui.ctx());
-            }
-            ui.separator();
+            toolbar_group(ui, |ui| {
+                if ui
+                    .add_enabled(
+                        self.project.layers.len() < MAX_LAYERS,
+                        egui::Button::new("+ Track"),
+                    )
+                    .on_hover_text("Add another video track (L)")
+                    .clicked()
+                {
+                    self.add_overlay_layer();
+                }
+                if ui
+                    .add_enabled(
+                        self.project.total_clips() < MAX_CLIPS,
+                        egui::Button::new("+ Text"),
+                    )
+                    .on_hover_text("Insert a title/caption section at the playhead")
+                    .clicked()
+                {
+                    self.add_text_section(ui.ctx());
+                }
+                if ui
+                    .button("Fit")
+                    .on_hover_text("Zoom the timeline to fit the whole project (Ctrl+Plus)")
+                    .clicked()
+                {
+                    self.zoom_to_fit();
+                }
+            });
             ui.checkbox(&mut self.snapping, "Snap")
                 .on_hover_text("Snap seeking and dragging to section edges and the playhead");
-            if ui
-                .button("Fit")
-                .on_hover_text("Zoom the timeline to fit the whole project (Ctrl+Plus)")
-                .clicked()
-            {
-                self.zoom_to_fit();
-            }
-            ui.separator();
-            ui.label(
-                RichText::new(format!(
-                    "{} sections  -  {}",
-                    self.project.total_clips(),
-                    fmt_time(self.project.duration())
-                ))
-                .small()
-                .weak(),
-            );
-            if ui.available_width() > 520.0 {
+            if ui.available_width() > 460.0 {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.label(
-                        RichText::new(
-                            "S split - X delete - Ctrl+D duplicate - Ctrl+C/V copy/paste - L/Y new track - Space play - RShift stop",
-                        )
-                        .small()
-                        .weak(),
+                        RichText::new("S split  ·  X delete  ·  Space play  ·  RShift stop")
+                            .small()
+                            .color(TEXT_DIM),
                     );
                 });
             }
         });
-        ui.add_space(4.0);
+        ui.add_space(8.0);
 
         let pps = self.pps;
         let duration = self.project.duration().max(1.0);
@@ -2358,7 +2726,7 @@ impl RunVideoApp {
         }
         let (area_rect, _) = ui.allocate_exact_size(area.size(), Sense::hover());
         let painter = ui.painter_at(area_rect);
-        painter.rect_filled(area_rect, CornerRadius::ZERO, Color32::from_rgb(17, 17, 21));
+        painter.rect_filled(area_rect, CornerRadius::ZERO, BG_DEEP);
 
         let header_w = ROW_HEADER.min(area_rect.width() * 0.42);
         let content_left = area_rect.left() + header_w;
@@ -3047,20 +3415,29 @@ impl RunVideoApp {
         let content_painter = ui.painter_at(content_view);
 
         // Ruler.
-        painter.rect_filled(ruler_rect, CornerRadius::ZERO, Color32::from_rgb(22, 22, 27));
+        painter.rect_filled(
+            ruler_rect,
+            egui::CornerRadius {
+                nw: 8,
+                ne: 8,
+                sw: 0,
+                se: 0,
+            },
+            SURFACE,
+        );
         painter.line_segment(
             [
                 egui::pos2(area_rect.left(), rows_top),
                 egui::pos2(area_rect.right(), rows_top),
             ],
-            Stroke::new(1.0, Color32::from_rgb(12, 12, 15)),
+            Stroke::new(1.0, HAIRLINE),
         );
         painter.text(
-            egui::pos2(area_rect.left() + 10.0, ruler_top + 8.0),
+            egui::pos2(area_rect.left() + 12.0, ruler_top + 9.0),
             Align2::LEFT_TOP,
             format!("{} tracks", layers.len()),
             FontId::proportional(10.0),
-            Color32::from_gray(110),
+            TEXT_DIM,
         );
         let step = choose_tick_step(pps);
         let mut t = ((h_off as f64 / pps as f64) / step).floor() * step;
@@ -3081,7 +3458,7 @@ impl RunVideoApp {
                     Stroke::new(1.0, Color32::from_gray(95)),
                 );
                 painter.text(
-                    egui::pos2(x + 3.0, ruler_top + 4.0),
+                    egui::pos2(x + 4.0, ruler_top + 11.0),
                     Align2::LEFT_TOP,
                     fmt_ruler(t),
                     FontId::monospace(10.0),
@@ -3106,22 +3483,20 @@ impl RunVideoApp {
             let selected = lv.index == selected_layer;
 
             // Header.
-            let hbg = if selected { ROW_BG_SELECTED } else { ROW_BG };
-            painter.rect_filled(r.header, CornerRadius::ZERO, hbg);
-            painter.line_segment(
-                [
-                    egui::pos2(r.header.left(), r.header.top()),
-                    egui::pos2(r.header.right(), r.header.top()),
-                ],
-                Stroke::new(1.0, Color32::from_rgb(14, 14, 17)),
-            );
+            let header_bg = r.header.shrink2(egui::vec2(0.0, 1.5));
+            let hbg = if selected {
+                Color32::from_rgb(37, 40, 48)
+            } else {
+                Color32::from_rgb(26, 28, 34)
+            };
+            painter.rect_filled(header_bg, CornerRadius::same(7), hbg);
             if selected {
                 painter.rect_filled(
                     Rect::from_min_max(
-                        r.header.left_top(),
-                        egui::pos2(r.header.left() + 3.0, r.header.bottom()),
+                        egui::pos2(header_bg.left() + 3.0, header_bg.top() + 6.0),
+                        egui::pos2(header_bg.left() + 6.0, header_bg.bottom() - 6.0),
                     ),
-                    CornerRadius::ZERO,
+                    CornerRadius::same(2),
                     ACCENT,
                 );
             }
@@ -3231,7 +3606,7 @@ impl RunVideoApp {
 
             // Row background.
             let rbg = if selected {
-                ROW_BG_SELECTED.gamma_multiply(0.55)
+                Color32::from_rgb(34, 32, 27)
             } else if lv.index % 2 == 0 {
                 ROW_BG
             } else {
@@ -3262,7 +3637,7 @@ impl RunVideoApp {
                     egui::pos2(content_left, r.rect.bottom()),
                     egui::pos2(area_rect.right(), r.rect.bottom()),
                 ],
-                Stroke::new(1.0, Color32::from_rgb(14, 14, 17)),
+                Stroke::new(1.0, HAIRLINE),
             );
 
             if lv.clips.is_empty() {
@@ -3271,7 +3646,7 @@ impl RunVideoApp {
                     Align2::LEFT_CENTER,
                     "Drop media here",
                     FontId::proportional(11.0),
-                    Color32::from_gray(105),
+                    Color32::from_gray(110),
                 );
             }
 
@@ -3282,8 +3657,8 @@ impl RunVideoApp {
                     continue;
                 }
                 let rect = Rect::from_min_max(
-                    egui::pos2(left, r.rect.top() + 3.0),
-                    egui::pos2(right.max(left + 6.0), r.rect.bottom() - 3.0),
+                    egui::pos2(left, r.rect.top() + 4.0),
+                    egui::pos2(right.max(left + 6.0), r.rect.bottom() - 4.0),
                 );
                 let is_selected = Some(cv.id) == selected_clip
                     || self.selected_clips.contains(&cv.id);
@@ -3299,14 +3674,39 @@ impl RunVideoApp {
                 } else {
                     base.gamma_multiply(0.85)
                 };
-                content_painter.rect_filled(rect, CornerRadius::same(4), base);
+                let radius = CornerRadius::same(7);
+                // Soft drop shadow, then the body and a top highlight so clips
+                // read as raised objects rather than flat rectangles.
+                content_painter.rect_filled(
+                    rect.translate(egui::vec2(0.0, 1.5)).shrink(1.0),
+                    radius,
+                    Color32::from_black_alpha(70),
+                );
+                content_painter.rect_filled(rect, radius, base);
+                if rect.height() > 16.0 {
+                    content_painter.line_segment(
+                        [
+                            egui::pos2(rect.left() + 8.0, rect.top() + 1.5),
+                            egui::pos2((rect.right() - 8.0).max(rect.left() + 8.0), rect.top() + 1.5),
+                        ],
+                        Stroke::new(1.0, Color32::from_white_alpha(38)),
+                    );
+                }
+                if is_selected {
+                    content_painter.rect_stroke(
+                        rect.expand(1.5),
+                        CornerRadius::same(8),
+                        Stroke::new(3.0, Color32::from_rgba_unmultiplied(255, 166, 48, 60)),
+                        StrokeKind::Outside,
+                    );
+                }
                 content_painter.rect_stroke(
                     rect,
-                    CornerRadius::same(4),
+                    radius,
                     if is_selected {
                         Stroke::new(2.0, ACCENT)
                     } else {
-                        Stroke::new(1.0, Color32::from_black_alpha(90))
+                        Stroke::new(1.0, Color32::from_black_alpha(80))
                     },
                     StrokeKind::Inside,
                 );
@@ -3321,9 +3721,9 @@ impl RunVideoApp {
                             let amp = inner.height() * 0.44;
                             let n = inner.width().max(1.0) as usize;
                             let color = if lv.visible {
-                                Color32::from_rgba_unmultiplied(210, 235, 255, 150)
+                                Color32::from_rgba_unmultiplied(205, 230, 255, 115)
                             } else {
-                                Color32::from_rgba_unmultiplied(160, 160, 170, 90)
+                                Color32::from_rgba_unmultiplied(160, 160, 170, 70)
                             };
                             for i in 0..n {
                                 let idx = (i * peaks.len() / n).min(peaks.len() - 1);
@@ -3362,16 +3762,35 @@ impl RunVideoApp {
                     }
                 }
                 let name_room = ((rect.right() - text_left - 8.0) / 6.2).max(2.0) as usize;
-                clipped.text(
-                    egui::pos2(text_left, rect.center().y),
-                    Align2::LEFT_CENTER,
-                    truncate(&cv.name, name_room),
+                let label = truncate(&cv.name, name_room);
+                let fg = if lv.visible {
+                    Color32::from_rgb(240, 240, 245)
+                } else {
+                    Color32::from_gray(150)
+                };
+                // Dark chip behind the label so it stays readable over the
+                // waveform and the thumbnail.
+                let galley = clipped.layout_no_wrap(
+                    label.clone(),
                     FontId::proportional(11.0),
-                    if lv.visible {
-                        Color32::from_rgb(235, 235, 240)
-                    } else {
-                        Color32::from_gray(140)
-                    },
+                    fg,
+                );
+                let chip = Rect::from_min_size(
+                    egui::pos2(
+                        text_left - 4.0,
+                        rect.center().y - galley.size().y / 2.0 - 2.0,
+                    ),
+                    galley.size() + egui::vec2(8.0, 4.0),
+                );
+                clipped.rect_filled(
+                    chip,
+                    CornerRadius::same(4),
+                    Color32::from_rgba_unmultiplied(12, 14, 18, 150),
+                );
+                clipped.galley(
+                    egui::pos2(text_left, rect.center().y - galley.size().y / 2.0),
+                    galley,
+                    fg,
                 );
                 if rect.width() > 110.0 {
                     clipped.text(
@@ -3488,17 +3907,24 @@ impl RunVideoApp {
         if px >= content_left - 2.0 && px <= area_rect.right() + 2.0 {
             let top = ruler_top;
             let bottom = area_rect.bottom();
+            let playhead = Color32::from_rgb(255, 96, 96);
+            // Soft glow so the playhead stays visible over busy waveforms.
             content_painter.line_segment(
                 [egui::pos2(px, rows_top), egui::pos2(px, bottom)],
-                Stroke::new(1.5, Color32::from_rgb(255, 92, 92)),
+                Stroke::new(5.0, Color32::from_rgba_unmultiplied(255, 96, 96, 34)),
             );
+            content_painter.line_segment(
+                [egui::pos2(px, rows_top), egui::pos2(px, bottom)],
+                Stroke::new(1.5, playhead),
+            );
+            painter.circle_filled(egui::pos2(px, top + 4.5), 4.5, playhead);
             painter.add(Shape::convex_polygon(
                 vec![
-                    egui::pos2(px - 5.0, top),
-                    egui::pos2(px + 5.0, top),
-                    egui::pos2(px, top + 8.0),
+                    egui::pos2(px - 5.0, top + 9.0),
+                    egui::pos2(px + 5.0, top + 9.0),
+                    egui::pos2(px, top + 15.0),
                 ],
-                Color32::from_rgb(255, 92, 92),
+                playhead,
                 Stroke::NONE,
             ));
         }
@@ -3582,15 +4008,17 @@ impl RunVideoApp {
         let ctx = ui.ctx().clone();
         egui::Panel::right("right_panel")
             .resizable(true)
-            .default_size(320.0)
-            .frame(egui::Frame::new().fill(PANEL_BG).inner_margin(egui::Margin::symmetric(10, 8)))
+            .min_size(320.0)
+            .max_size(430.0)
+            .default_size(340.0)
+            .frame(
+                egui::Frame::new()
+                    .fill(PANEL_BG)
+                    .inner_margin(egui::Margin::symmetric(12, 10)),
+            )
             .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.selectable_value(&mut self.panel_tab, PanelTab::Section, "Section");
-                    ui.selectable_value(&mut self.panel_tab, PanelTab::Layer, "Layer");
-                    ui.selectable_value(&mut self.panel_tab, PanelTab::Project, "Project");
-                });
-                ui.add_space(6.0);
+                tab_strip(ui, &mut self.panel_tab);
+                ui.add_space(10.0);
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| match self.panel_tab {
@@ -3641,7 +4069,7 @@ impl RunVideoApp {
         }
         ui.add_space(8.0);
         // Track state toggles (kept in sync with the timeline headers).
-        ui.label(RichText::new("Track").small().strong());
+        section_label(ui, "Track");
         let mut track_change = false;
         ui.horizontal(|ui| {
             let mut visible = self.project.layers[li].visible;
@@ -3753,17 +4181,33 @@ impl RunVideoApp {
     fn inspector_ui(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
         let layer = self.selected_layer.min(self.project.layers.len().saturating_sub(1));
         let Some(id) = self.selected_clip else {
-            ui.label(
-                RichText::new("No section selected").strong(),
-            );
-            ui.label(
-                RichText::new("Click a section on the timeline to trim it, split it, or change its length.")
+            ui.add_space(10.0);
+            ui.vertical_centered(|ui| {
+                // Draw an empty-frame glyph instead of a font symbol (none of the
+                // bundled fonts have one that renders reliably).
+                let (icon_rect, _) = ui.allocate_exact_size(egui::vec2(34.0, 26.0), Sense::hover());
+                ui.painter().rect_stroke(
+                    icon_rect.shrink(6.0),
+                    egui::CornerRadius::same(4),
+                    Stroke::new(1.5, Color32::from_rgb(66, 72, 86)),
+                    StrokeKind::Inside,
+                );
+                ui.add_space(4.0);
+                ui.label(RichText::new("No section selected").strong().color(TEXT));
+                ui.label(
+                    RichText::new(
+                        "Click a section on the timeline to trim it, split it, or change its length.",
+                    )
                     .small()
-                    .weak(),
-            );
-            ui.add_space(6.0);
+                    .color(TEXT_DIM),
+                );
+            });
+            ui.add_space(10.0);
             if ui
-                .button(format!("+ Add media to {}", self.project.layers[layer].name))
+                .add_sized(
+                    [ui.available_width(), 30.0],
+                    egui::Button::new(format!("+  Add media to {}", self.project.layers[layer].name)),
+                )
                 .clicked()
             {
                 self.add_media_dialog_for(ctx, layer);
@@ -3782,32 +4226,48 @@ impl RunVideoApp {
         let name = self.project.layers[li].clips[ci].name.clone();
         let path = self.project.layers[li].clips[ci].path.clone();
         let has_audio = self.project.layers[li].clips[ci].has_audio;
-        ui.horizontal(|ui| {
-            ui.label(RichText::new(truncate(&name, 28)).strong());
-            let (tag, color) = match kind {
-                MediaKind::Video => ("VIDEO", VIDEO_BG_HOVER),
-                MediaKind::Image => ("PHOTO", ACCENT),
-                MediaKind::Text => ("TEXT", TEXT_BG),
-            };
-            ui.label(RichText::new(tag).small().color(color));
-        });
-        if !kind.is_text() {
-            ui.add(
-                egui::Label::new(RichText::new(path.display().to_string()).small().weak())
-                    .truncate(),
-            )
-            .on_hover_text(path.display().to_string());
-        }
-        if kind == MediaKind::Video {
-            ui.label(
-                RichText::new(format!(
-                    "Audio: {}",
-                    if has_audio { "yes (mixed on export)" } else { "none" }
-                ))
-                .small()
-                .weak(),
-            );
-        }
+        let (tag, color) = match kind {
+            MediaKind::Video => ("VIDEO", VIDEO_BG_HOVER),
+            MediaKind::Image => ("PHOTO", ACCENT),
+            MediaKind::Text => ("TEXT", TEXT_BG),
+        };
+        // Section header card: name, kind badge, and source path.
+        egui::Frame::new()
+            .fill(SURFACE)
+            .stroke(Stroke::new(1.0, BORDER))
+            .corner_radius(egui::CornerRadius::same(10))
+            .inner_margin(egui::Margin::symmetric(10, 8))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(truncate(&name, 26)).strong().size(14.0).color(TEXT));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        pill(ui, tag, 9.5, color, Color32::from_black_alpha(70));
+                    });
+                });
+                if !kind.is_text() {
+                    ui.add(
+                        egui::Label::new(
+                            RichText::new(path.display().to_string())
+                                .small()
+                                .color(TEXT_DIM),
+                        )
+                        .truncate(),
+                    )
+                    .on_hover_text(path.display().to_string());
+                }
+                if kind == MediaKind::Video {
+                    ui.label(
+                        RichText::new(format!(
+                            "Audio: {}",
+                            if has_audio { "yes (mixed on export)" } else { "none" }
+                        ))
+                        .small()
+                        .color(TEXT_DIM),
+                    );
+                }
+            });
+        ui.add_space(8.0);
 
         let mut changed = false;
         let layer_origin = self.project.layers[li].start.max(0.0);
@@ -3875,7 +4335,7 @@ impl RunVideoApp {
                     }
                 });
                 ui.add_space(2.0);
-                ui.label(RichText::new("Style").small().strong());
+                section_label(ui, "Text style");
                 ui.horizontal(|ui| {
                     ui.label("Outline");
                     text_changed |= ui
@@ -3924,7 +4384,7 @@ impl RunVideoApp {
                             }
                         });
                 });
-                ui.label(RichText::new("Title templates").small().strong());
+                section_label(ui, "Title templates");
                 ui.horizontal_wrapped(|ui| {
                     for (label, size, outline, shadow, align, valign, boxed, bold) in [
                         ("Title", 96.0, 4.0, 8.0, TextAlign::Center, VAlign::Middle, false, true),
@@ -4100,7 +4560,7 @@ impl RunVideoApp {
             // ---- Audio (video only) -----------------------------------------
             if kind == MediaKind::Video && has_audio {
                 ui.add_space(2.0);
-                ui.label(RichText::new("Audio").small().strong());
+                section_label(ui, "Audio");
                 let mut vol = clip.volume;
                 if ui
                     .add(
@@ -4551,16 +5011,20 @@ impl RunVideoApp {
             } else {
                 clip.transform_at(local)
             };
-            ui.horizontal(|ui| {
-                ui.label("X");
-                changed |= ui
-                    .add(egui::Slider::new(&mut t.x, -1.0..=1.5).fixed_decimals(2))
-                    .changed();
-                ui.label("Y");
-                changed |= ui
-                    .add(egui::Slider::new(&mut t.y, -1.0..=1.5).fixed_decimals(2))
-                    .changed();
-            });
+            changed |= ui
+                .add(
+                    egui::Slider::new(&mut t.x, -1.0..=1.5)
+                        .text("X")
+                        .fixed_decimals(2),
+                )
+                .changed();
+            changed |= ui
+                .add(
+                    egui::Slider::new(&mut t.y, -1.0..=1.5)
+                        .text("Y")
+                        .fixed_decimals(2),
+                )
+                .changed();
             changed |= ui
                 .add(egui::Slider::new(&mut t.scale, 0.02..=2.0).text("Scale"))
                 .changed();
@@ -4609,77 +5073,78 @@ impl RunVideoApp {
 
     fn project_ui(&mut self, ui: &mut egui::Ui) {
         let mut dirty = false;
-        ui.label(RichText::new("Project settings").strong());
-        ui.horizontal(|ui| {
-            ui.label("Name");
-            let resp = ui.add(
-                egui::TextEdit::singleline(&mut self.project.name).desired_width(180.0),
+        section_label(ui, "Project");
+        card(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Name");
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut self.project.name).desired_width(180.0),
+                );
+                if resp.changed() {
+                    dirty = true;
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("Resolution");
+                let current = format!("{} x {}", self.project.width, self.project.height);
+                let mut selected: Option<(u32, u32)> = None;
+                egui::ComboBox::from_id_salt("project_resolution")
+                    .selected_text(current)
+                    .show_ui(ui, |ui| {
+                        for (w, h, label) in [
+                            (1920u32, 1080u32, "1080p - 1920 x 1080"),
+                            (1280, 720, "720p - 1280 x 720"),
+                            (3840, 2160, "4K - 3840 x 2160"),
+                            (1080, 1920, "Vertical - 1080 x 1920"),
+                            (1080, 1080, "Square - 1080 x 1080"),
+                        ] {
+                            if ui
+                                .selectable_label(self.project.width == w && self.project.height == h, label)
+                                .clicked()
+                            {
+                                selected = Some((w, h));
+                            }
+                        }
+                    });
+                if let Some((w, h)) = selected {
+                    self.project.width = w;
+                    self.project.height = h;
+                    self.after_edit();
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("Frame rate");
+                let mut selected: Option<u32> = None;
+                egui::ComboBox::from_id_salt("project_fps")
+                    .selected_text(format!("{} fps", self.project.fps))
+                    .show_ui(ui, |ui| {
+                        for fps in [24u32, 25, 30, 50, 60] {
+                            if ui
+                                .selectable_label(self.project.fps == fps, format!("{fps} fps"))
+                                .clicked()
+                            {
+                                selected = Some(fps);
+                            }
+                        }
+                    });
+                if let Some(fps) = selected {
+                    self.project.fps = fps;
+                    self.after_edit();
+                }
+            });
+            ui.label(
+                RichText::new(format!(
+                    "{} sections of {}  ·  {} layers of {}",
+                    self.project.total_clips(),
+                    MAX_CLIPS,
+                    self.project.layers.len(),
+                    MAX_LAYERS
+                ))
+                .small()
+                .color(TEXT_DIM),
             );
-            if resp.changed() {
-                dirty = true;
-            }
         });
-        ui.horizontal(|ui| {
-            ui.label("Resolution");
-            let current = format!("{} x {}", self.project.width, self.project.height);
-            let mut selected: Option<(u32, u32)> = None;
-            egui::ComboBox::from_id_salt("project_resolution")
-                .selected_text(current)
-                .show_ui(ui, |ui| {
-                    for (w, h, label) in [
-                        (1920u32, 1080u32, "1080p - 1920 x 1080"),
-                        (1280, 720, "720p - 1280 x 720"),
-                        (3840, 2160, "4K - 3840 x 2160"),
-                        (1080, 1920, "Vertical - 1080 x 1920"),
-                        (1080, 1080, "Square - 1080 x 1080"),
-                    ] {
-                        if ui
-                            .selectable_label(self.project.width == w && self.project.height == h, label)
-                            .clicked()
-                        {
-                            selected = Some((w, h));
-                        }
-                    }
-                });
-            if let Some((w, h)) = selected {
-                self.project.width = w;
-                self.project.height = h;
-                self.after_edit();
-            }
-        });
-        ui.horizontal(|ui| {
-            ui.label("Frame rate");
-            let mut selected: Option<u32> = None;
-            egui::ComboBox::from_id_salt("project_fps")
-                .selected_text(format!("{} fps", self.project.fps))
-                .show_ui(ui, |ui| {
-                    for fps in [24u32, 25, 30, 50, 60] {
-                        if ui
-                            .selectable_label(self.project.fps == fps, format!("{fps} fps"))
-                            .clicked()
-                        {
-                            selected = Some(fps);
-                        }
-                    }
-                });
-            if let Some(fps) = selected {
-                self.project.fps = fps;
-                self.after_edit();
-            }
-        });
-        ui.label(
-            RichText::new(format!(
-                "{} sections of {}  -  {} layers of {}",
-                self.project.total_clips(),
-                MAX_CLIPS,
-                self.project.layers.len(),
-                MAX_LAYERS
-            ))
-            .small()
-            .weak(),
-        );
-        ui.separator();
-        ui.label(RichText::new("Playback speed (whole project)").strong());
+        section_label(ui, "Playback speed (whole project)");
         let mut apply_speed: Option<f64> = None;
         ui.horizontal(|ui| {
             ui.label("Speed");
@@ -4787,8 +5252,7 @@ impl RunVideoApp {
         });
         ui.checkbox(&mut self.project.normalize_audio, "Normalize loudness (-16 LUFS)")
             .on_hover_text("EBU R128 loudness normalisation and peak limiting on export");
-        ui.separator();
-        ui.label(RichText::new("Subtitles").small().strong());
+        section_label(ui, "Subtitles");
         ui.horizontal(|ui| {
             if ui
                 .button("Import SRT")
@@ -4813,13 +5277,12 @@ impl RunVideoApp {
             .on_hover_text(path.display().to_string());
         }
         ui.add_space(8.0);
-        ui.separator();
-        ui.label(RichText::new("Markers").small().strong());
+        section_label(ui, "Markers");
         if self.project.markers.is_empty() {
             ui.label(
                 RichText::new("No markers. Press M at the playhead to add one.")
                     .small()
-                    .weak(),
+                    .color(TEXT_DIM),
             );
         } else {
             let snapshot = self.project.markers.clone();
@@ -4858,13 +5321,19 @@ impl RunVideoApp {
     // ------------------------------------------------------------------
 
     fn preview_ui(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
-        let controls_h = 42.0;
+        let controls_h = 46.0;
         let avail = ui.available_size();
         let preview_h = (avail.y - controls_h).max(80.0);
         let (area, _) =
             ui.allocate_exact_size(egui::vec2(avail.x, preview_h), Sense::hover());
         let painter = ui.painter_at(area);
-        painter.rect_filled(area, CornerRadius::same(6), Color32::from_rgb(12, 12, 15));
+        painter.rect_filled(area, CornerRadius::same(12), BG_DEEP);
+        painter.rect_stroke(
+            area,
+            CornerRadius::same(12),
+            Stroke::new(1.0, HAIRLINE),
+            StrokeKind::Inside,
+        );
 
         let aspect = self.project.width.max(1) as f32 / self.project.height.max(1) as f32;
         let mut w = area.width().min(area.height() * aspect);
@@ -4967,86 +5436,114 @@ impl RunVideoApp {
             );
         }
 
-        ui.add_space(6.0);
+        ui.add_space(8.0);
         ui.horizontal(|ui| {
-            let play_label = if self.playing { "Pause" } else { "Play" };
-            if ui
-                .add_sized([76.0, 28.0], egui::Button::new(play_label))
-                .on_hover_text("Space - play from the start marker (or beginning). Right Shift also stops.")
-                .clicked()
+            // Primary transport: big accent Play/Pause.
+            let playing = self.playing;
+            let (label, hint) = if playing {
+                ("Pause", "Space - pause playback")
+            } else {
+                ("Play", "Space - play from the start marker (or beginning)")
+            };
+            if icon_button(
+                ui,
+                if playing { Icon::Pause } else { Icon::Play },
+                label,
+                true,
+                92.0,
+            )
+            .on_hover_text(hint)
+            .clicked()
             {
                 self.toggle_play();
             }
-            if ui
-                .button("Resume")
-                .on_hover_text("Enter - continue from the current playhead")
-                .clicked()
-            {
-                if self.playing {
-                    self.pause();
-                } else {
-                    self.resume();
-                }
-            }
-            if ui
-                .button("Stop")
+            if icon_button(ui, Icon::Stop, "Stop", false, 78.0)
                 .on_hover_text("Return to the start marker (or beginning)")
                 .clicked()
             {
                 self.stop();
             }
-            let loop_label = if self.loop_playback { "Loop: on" } else { "Loop: off" };
-            if ui
-                .selectable_label(self.loop_playback, loop_label)
-                .on_hover_text("Replay the whole timeline when playback ends")
-                .clicked()
-            {
-                self.loop_playback = !self.loop_playback;
-            }
-            ui.add_space(4.0);
-            ui.label(
-                RichText::new(format!(
-                    "{} / {}",
+            ui.add_space(2.0);
+            // Timecode pill: current / total.
+            pill(
+                ui,
+                &format!(
+                    "{}  /  {}",
                     fmt_time(self.position),
                     fmt_time(self.project.duration())
-                ))
-                .monospace(),
+                ),
+                12.5,
+                TEXT,
+                Color32::from_rgb(20, 21, 26),
             );
-            ui.separator();
-            if ui.small_button("Split (S)").clicked() {
+            ui.add_space(4.0);
+            if ui
+                .add_sized([74.0, 30.0], egui::Button::new("Split  S"))
+                .on_hover_text("Split the selected section at the playhead (S)")
+                .clicked()
+            {
                 self.split();
             }
-            if ui.small_button("Delete (X)").clicked() {
+            if ui
+                .add_sized([80.0, 30.0], egui::Button::new("Delete  X"))
+                .on_hover_text("Delete the selected section (X)")
+                .clicked()
+            {
                 self.delete_selected();
             }
-            ui.separator();
+            ui.add_space(2.0);
             let marker_label = match self.project.start_marker {
-                Some(t) => format!("Start: {}", fmt_time(t)),
-                None => "Start: none".to_owned(),
+                Some(t) => format!("Start  {}", fmt_time(t)),
+                None => "Start  -".to_owned(),
             };
             if ui
-                .small_button(marker_label)
+                .add_sized([96.0, 30.0], egui::Button::new(marker_label))
                 .on_hover_text("Set playback start marker here (F)")
                 .clicked()
             {
                 self.set_start_marker();
             }
-            if self.project.start_marker.is_some() && ui.small_button("Clear (T)").clicked() {
-                self.clear_start_marker();
-            }
-            let room = ui.available_width();
-            if room > 300.0 {
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.label(
-                        RichText::new(if self.fullscreen {
-                            "Fullscreen preview - F11 or Esc to exit"
+            // Secondary controls only appear when the column is wide enough,
+            // so the row never spills over the preview's rounded edge.
+            if ui.available_width() > 150.0 {
+                if self.project.start_marker.is_some()
+                    && ui
+                        .add_sized([54.0, 30.0], egui::Button::new("Clear"))
+                        .on_hover_text("Remove the start marker (T)")
+                        .clicked()
+                {
+                    self.clear_start_marker();
+                }
+                if ui.available_width() > 190.0 {
+                    let loop_label = if self.loop_playback { "Loop on" } else { "Loop off" };
+                    if ui
+                        .add_sized(
+                            [72.0, 30.0],
+                            egui::Button::new(loop_label).fill(if self.loop_playback {
+                                ACCENT_DIM
+                            } else {
+                                SURFACE
+                            }),
+                        )
+                        .on_hover_text("Replay the whole timeline when playback ends")
+                        .clicked()
+                    {
+                        self.loop_playback = !self.loop_playback;
+                    }
+                }
+                if ui.available_width() > 140.0 {
+                    if ui
+                        .add_sized([64.0, 30.0], egui::Button::new("Resume"))
+                        .on_hover_text("Enter - continue from the current playhead")
+                        .clicked()
+                    {
+                        if self.playing {
+                            self.pause();
                         } else {
-                            "Live preview mix - export matches this soundtrack"
-                        })
-                        .small()
-                        .weak(),
-                    );
-                });
+                            self.resume();
+                        }
+                    }
+                }
             }
         });
         if self.playing {
@@ -5271,64 +5768,99 @@ impl RunVideoApp {
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
+            .default_width(400.0)
             .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
             .show(ctx, |ui| {
                 let Some(state) = &self.export else {
-                    ui.label("No export running.");
+                    ui.label(RichText::new("No export running.").color(TEXT_DIM));
                     return;
                 };
                 match &state.finished {
                     None => {
-                        ui.label(format!(
-                            "Rendering your timeline with FFmpeg (x264 preset: {})...",
-                            self.export_preset
-                        ));
-                        ui.add_space(6.0);
+                        ui.label(
+                            RichText::new(format!(
+                                "Rendering your timeline with FFmpeg (x264 preset: {})...",
+                                self.export_preset
+                            ))
+                            .color(TEXT_DIM),
+                        );
+                        ui.add_space(8.0);
                         ui.add(
                             egui::ProgressBar::new(state.progress)
-                                .desired_width(340.0)
+                                .desired_width(360.0)
+                                .desired_height(10.0)
+                                .fill(ACCENT)
                                 .show_percentage(),
                         );
-                        ui.add_space(6.0);
+                        ui.add_space(10.0);
                         if ui.button("Cancel export").clicked() {
                             state.cancel.store(true, Ordering::Relaxed);
                         }
                     }
                     Some(Ok(path)) => {
-                        ui.label(RichText::new("Export complete.").color(OK_COLOR).strong());
-                        ui.add_space(4.0);
-                        ui.add(
-                            egui::Label::new(path.display().to_string())
-                                .truncate(),
-                        )
-                        .on_hover_text(path.display().to_string());
+                        ui.horizontal(|ui| {
+                            check_badge(ui, 20.0);
+                            ui.add_space(2.0);
+                            ui.label(
+                                RichText::new("Export complete")
+                                    .color(OK_COLOR)
+                                    .strong()
+                                    .size(15.0),
+                            );
+                        });
+                        ui.add_space(6.0);
+                        egui::Frame::new()
+                            .fill(SURFACE)
+                            .stroke(Stroke::new(1.0, BORDER))
+                            .corner_radius(egui::CornerRadius::same(8))
+                            .inner_margin(egui::Margin::symmetric(9, 7))
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(path.display().to_string())
+                                            .small()
+                                            .color(TEXT_DIM),
+                                    )
+                                    .truncate(),
+                                )
+                                .on_hover_text(path.display().to_string());
+                            });
                         ui.add_space(10.0);
                         ui.horizontal(|ui| {
                             if ui
-                                .button("Open video")
+                                .add_sized([104.0, 30.0], egui::Button::new("Open video"))
                                 .on_hover_text("Play the exported file with your default player")
                                 .clicked()
                             {
                                 open_video = Some(path.clone());
                             }
                             if ui
-                                .button("Open video location")
+                                .add_sized([140.0, 30.0], egui::Button::new("Open video location"))
                                 .on_hover_text("Show the exported file in the file manager")
                                 .clicked()
                             {
                                 reveal_video = Some(path.clone());
                             }
-                            if ui.button("Close").clicked() {
+                            if ui
+                                .add_sized([70.0, 30.0], egui::Button::new("Close"))
+                                .clicked()
+                            {
                                 close_requested = true;
                             }
                         });
                     }
                     Some(Err(err)) => {
-                        ui.label(RichText::new("Export failed.").color(ERR_COLOR).strong());
+                        ui.label(
+                            RichText::new("Export failed")
+                                .color(ERR_COLOR)
+                                .strong()
+                                .size(15.0),
+                        );
                         ui.add_space(4.0);
-                        ui.label(err.as_str());
+                        ui.label(RichText::new(err.as_str()).small().color(TEXT_DIM));
                         ui.add_space(10.0);
-                        if ui.button("Close").clicked() {
+                        if ui.add_sized([80.0, 30.0], egui::Button::new("Close")).clicked() {
                             close_requested = true;
                         }
                     }
@@ -5441,16 +5973,23 @@ impl RunVideoApp {
                     for (title, rows) in sections {
                         ui.add_space(4.0);
                         ui.label(RichText::new(*title).strong().color(ACCENT));
-                        egui::Grid::new(format!("help_{title}"))
-                            .num_columns(2)
-                            .spacing([18.0, 4.0])
-                            .show(ui, |ui| {
-                                for (key, what) in *rows {
-                                    ui.label(RichText::new(*key).monospace().strong());
-                                    ui.label(*what);
-                                    ui.end_row();
-                                }
-                            });
+                        ui.scope(|ui| {
+                            // Keep the shortcut table compact; the global
+                            // interact size is sized for buttons, not text rows.
+                            ui.spacing_mut().interact_size.y = 18.0;
+                            egui::Grid::new(format!("help_{title}"))
+                                .num_columns(2)
+                                .spacing([22.0, 5.0])
+                                .min_row_height(20.0)
+                                .show(ui, |ui| {
+                                    for (key, what) in *rows {
+                                        ui.label(RichText::new(*key).monospace().strong());
+                                        ui.label(RichText::new(*what).color(TEXT));
+                                        ui.end_row();
+                                    }
+                                });
+                        });
+                        ui.add_space(2.0);
                     }
                     ui.add_space(8.0);
                     ui.label(
@@ -5544,21 +6083,38 @@ impl RunVideoApp {
         egui::Panel::top("recovery_bar")
             .frame(
                 egui::Frame::new()
-                    .fill(Color32::from_rgb(60, 48, 20))
-                    .inner_margin(egui::Margin::symmetric(10, 6)),
+                    .fill(Color32::from_rgb(46, 38, 20))
+                    .inner_margin(egui::Margin::symmetric(14, 7)),
             )
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(
                         RichText::new("An autosaved project from a previous session was found.")
-                            .color(Color32::from_rgb(240, 210, 120)),
+                            .color(Color32::from_rgb(242, 214, 138)),
                     );
-                    if ui.button("Recover").clicked() {
-                        self.recover_autosave(ctx);
-                    }
-                    if ui.button("Discard").clicked() {
-                        self.discard_recovery();
-                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui
+                            .add_sized([74.0, 26.0], egui::Button::new("Discard"))
+                            .clicked()
+                        {
+                            self.discard_recovery();
+                        }
+                        if ui
+                            .add_sized(
+                                [84.0, 26.0],
+                                egui::Button::new(
+                                    RichText::new("Recover")
+                                        .strong()
+                                        .color(Color32::from_rgb(30, 22, 6)),
+                                )
+                                .fill(ACCENT)
+                                .stroke(Stroke::NONE),
+                            )
+                            .clicked()
+                        {
+                            self.recover_autosave(ctx);
+                        }
+                    });
                 });
             });
     }
@@ -5594,7 +6150,7 @@ impl eframe::App for RunVideoApp {
             self.right_panel(ui);
         }
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(PANEL_BG).inner_margin(egui::Margin::same(8)))
+            .frame(egui::Frame::new().fill(BG_DEEP).inner_margin(egui::Margin::same(12)))
             .show(ui, |ui| {
                 self.preview_ui(&ctx, ui);
             });
