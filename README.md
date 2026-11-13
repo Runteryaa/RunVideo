@@ -59,6 +59,7 @@ codec can never take the application down with it.
 | **Silence auto cut** | Detect quiet passages in a video section and keep only the audible parts |
 | **Multi-select, ripple and insert editing** | `Ctrl+click` multiple sections, ripple-delete them, or insert-edit the clipboard at the playhead |
 | **Loudness normalisation** | Optional EBU R128 loudness normalisation (−16 LUFS) plus peak limiting on export |
+| **Polished interface** | Layered dark surfaces, grouped toolbar, segmented inspector tabs, raised timeline clips and a glowing playhead |
 
 Also included: snapping, undo/redo, project save/load (`.rvproj`), thumbnails,
 drag-and-drop import, frame-accurate preview, and MP4 export with mixed audio.
