@@ -3,8 +3,21 @@
 A small, fast, layer-based video editor written in Rust.
 
 **Download:** grab the latest Windows build from
-[Releases](https://github.com/Runteryaa/RunVideo/releases). FFmpeg (`ffmpeg` and
-`ffprobe`) must be on your `PATH`.
+[Releases](https://github.com/Runteryaa/RunVideo/releases).
+
+### Installing
+
+| Download | What you get |
+| --- | --- |
+| `RunVideo-<version>-setup.exe` **(recommended)** | A normal Windows installer. It bundles FFmpeg and ffprobe, so there is nothing else to install. Adds Start Menu (and optional desktop) shortcuts plus an uninstaller. |
+| `RunVideo-<version>-portable.zip` | The same app with FFmpeg included, unpacked into a folder. Extract it anywhere and run `runvideo.exe`; delete the folder to remove it. |
+| `runvideo.exe` | Only the editor binary. This one **does need FFmpeg**: put `ffmpeg.exe` and `ffprobe.exe` on your `PATH`, or create a `ffmpeg\bin` folder next to the executable with both files in it. |
+
+RunVideo looks for FFmpeg in `ffmpeg\bin` beside its own executable first, then
+falls back to `PATH`. Building from source also works with any FFmpeg on `PATH`.
+
+If Windows shows a SmartScreen warning for the installer, it is unsigned:
+choose **More info → Run anyway**.
 
 RunVideo edits video and photos on a multi-layer timeline and renders the final
 result with FFmpeg. The UI runs on [egui](https://github.com/emilk/egui); media
@@ -238,6 +251,11 @@ runvideo --export project.rvproj out.m4a ultrafast audio
 `loudnorm` and a peak limiter on export, so dialogue and music land at a
 consistent, streaming-friendly level.
 
+When the export finishes, the progress window offers **Open video** (plays the
+file with your default player) and **Open video location** (reveals it in File
+Explorer with the file selected), so you don't have to hunt for the output in
+the save folder.
+
 ### Fullscreen preview and frame capture
 
 Press `F11` (or click **Fullscreen** in the toolbar) to hide the top bar, timeline
@@ -393,7 +411,8 @@ hidden.
 ## Requirements
 
 - Rust (stable)
-- **FFmpeg** (`ffmpeg.exe` and `ffprobe.exe` on `PATH`)
+- **FFmpeg** (`ffmpeg.exe` and `ffprobe.exe` on `PATH`, or in `ffmpeg\bin` next
+  to `runvideo.exe`)
 - Windows GNU toolchain needs MinGW (see below). MSVC toolchains work directly.
 
 ## Run
@@ -433,6 +452,23 @@ $env:PATH = "$mingw;$env:PATH"
 $env:CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER = "$mingw\x86_64-w64-mingw32-gcc.exe"
 cargo build --release --target x86_64-pc-windows-gnu
 ```
+
+### Installer
+
+`installer\build.ps1` produces both release packages in `dist\`: the Inno Setup
+installer and the portable zip, each with FFmpeg bundled.
+
+```powershell
+winget install JRSoftware.InnoSetup
+.\installer\build.ps1              # version comes from Cargo.toml
+.\installer\build.ps1 -Version 0.2.0
+```
+
+It copies `ffmpeg.exe`/`ffprobe.exe` from `-FfmpegDir` (or from the FFmpeg on
+`PATH`) into `vendor\ffmpeg`, builds the release binary, compiles
+`installer\runvideo.iss` with `ISCC.exe`, and zips the portable layout. Pushing a
+`v*` tag runs the same script on GitHub Actions and attaches the results to the
+release.
 
 ## How layering works
 

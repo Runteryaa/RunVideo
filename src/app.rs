@@ -5265,6 +5265,8 @@ impl RunVideoApp {
         }
         let mut open = true;
         let mut close_requested = false;
+        let mut open_video: Option<PathBuf> = None;
+        let mut reveal_video: Option<PathBuf> = None;
         egui::Window::new("Export video")
             .open(&mut open)
             .collapsible(false)
@@ -5301,9 +5303,25 @@ impl RunVideoApp {
                         )
                         .on_hover_text(path.display().to_string());
                         ui.add_space(10.0);
-                        if ui.button("Close").clicked() {
-                            close_requested = true;
-                        }
+                        ui.horizontal(|ui| {
+                            if ui
+                                .button("Open video")
+                                .on_hover_text("Play the exported file with your default player")
+                                .clicked()
+                            {
+                                open_video = Some(path.clone());
+                            }
+                            if ui
+                                .button("Open video location")
+                                .on_hover_text("Show the exported file in the file manager")
+                                .clicked()
+                            {
+                                reveal_video = Some(path.clone());
+                            }
+                            if ui.button("Close").clicked() {
+                                close_requested = true;
+                            }
+                        });
                     }
                     Some(Err(err)) => {
                         ui.label(RichText::new("Export failed.").color(ERR_COLOR).strong());
@@ -5316,6 +5334,12 @@ impl RunVideoApp {
                     }
                 }
             });
+        if let Some(path) = open_video {
+            open_with_default_app(&path);
+        }
+        if let Some(path) = reveal_video {
+            reveal_in_file_manager(&path);
+        }
         if close_requested {
             self.show_export = false;
             self.export = None;
@@ -5590,6 +5614,50 @@ impl eframe::App for RunVideoApp {
 // ---------------------------------------------------------------------------
 // Small helpers
 // ---------------------------------------------------------------------------
+
+/// Open a file with the OS's default application (the exported video's player).
+fn open_with_default_app(path: &Path) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // `start` needs an explicit title argument, otherwise a quoted path is
+        // taken as the window title. raw_arg keeps our quoting intact.
+        let _ = std::process::Command::new("cmd")
+            .raw_arg(format!("/C start \"\" \"{}\"", path.display()))
+            .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+            .spawn();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open").arg(path).spawn();
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let _ = std::process::Command::new("xdg-open").arg(path).spawn();
+    }
+}
+
+/// Reveal a file in the OS file manager with the file selected.
+fn reveal_in_file_manager(path: &Path) {
+    #[cfg(windows)]
+    {
+        // explorer returns a non-zero exit code even on success, so ignore it.
+        let _ = std::process::Command::new("explorer")
+            .arg("/select,")
+            .arg(path)
+            .spawn();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open").arg("-R").arg(path).spawn();
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        // Most Linux file managers have no portable "select" flag; show the folder.
+        let dir = path.parent().unwrap_or(path);
+        let _ = std::process::Command::new("xdg-open").arg(dir).spawn();
+    }
+}
 
 fn fmt_time(t: f64) -> String {
     let t = t.max(0.0);

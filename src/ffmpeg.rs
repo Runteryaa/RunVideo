@@ -43,8 +43,36 @@ pub fn spawn_quiet(cmd: &mut Command) -> std::io::Result<std::process::Child> {
     Ok(child)
 }
 
+/// Locate an FFmpeg tool, preferring a copy shipped next to the executable.
+///
+/// The installer and the portable build both put FFmpeg in `ffmpeg\bin` beside
+/// `runvideo.exe`, so the app works without FFmpeg being on `PATH`. When no
+/// bundled copy exists the plain program name is returned and Windows resolves
+/// it through `PATH` as before.
+fn resolve_tool(program: &str) -> std::ffi::OsString {
+    let file = if cfg!(windows) {
+        format!("{program}.exe")
+    } else {
+        program.to_owned()
+    };
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            for candidate in [
+                dir.join("ffmpeg").join("bin").join(&file),
+                dir.join(&file),
+                dir.join("ffmpeg").join(&file),
+            ] {
+                if candidate.is_file() {
+                    return candidate.into_os_string();
+                }
+            }
+        }
+    }
+    program.into()
+}
+
 pub fn command(program: &str) -> Command {
-    let mut cmd = Command::new(program);
+    let mut cmd = Command::new(resolve_tool(program));
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;

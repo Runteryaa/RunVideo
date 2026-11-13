@@ -14,9 +14,14 @@ on:
 permissions:
   contents: write
 
+env:
+  # Static MSVC runtime so the executable runs on Windows installs that do not
+  # have the Visual C++ redistributable.
+  RUSTFLAGS: -C target-feature=+crt-static
+
 jobs:
   build:
-    name: Build Windows .exe
+    name: Build Windows installer
     runs-on: windows-latest
     steps:
       - name: Checkout
@@ -31,10 +36,19 @@ jobs:
           cache-on-failure: true
 
       - name: Install FFmpeg
+        shell: pwsh
         run: |
-          choco install ffmpeg -y --no-progress
-          ffmpeg -version
-          ffprobe -version
+          $zip = Join-Path $env:RUNNER_TEMP "ffmpeg.zip"
+          Invoke-WebRequest -Uri "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip" -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath $env:RUNNER_TEMP\ffmpeg -Force
+          $bin = (Get-ChildItem $env:RUNNER_TEMP\ffmpeg -Recurse -Filter ffmpeg.exe | Select-Object -First 1).DirectoryName
+          "FFMPEG_DIR=$bin" | Out-File -FilePath $env:GITHUB_ENV -Append
+          $bin | Out-File -FilePath $env:GITHUB_PATH -Append
+          & "$bin\ffmpeg.exe" -version | Select-Object -First 1
+          & "$bin\ffprobe.exe" -version | Select-Object -First 1
+
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress -y
 
       - name: Run tests
         run: cargo test --release
@@ -42,22 +56,25 @@ jobs:
       - name: Build release executable
         run: cargo build --release --locked
 
-      - name: Stage release files
+      - name: Build installer and portable package
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item target/release/runvideo.exe dist/runvideo.exe
-          Copy-Item README.md dist/README.md
-          Compress-Archive -Path dist/runvideo.exe, dist/README.md -DestinationPath dist/runvideo-windows-x86_64.zip -Force
-          Get-ChildItem dist | Select-Object Name, Length
+          $tag = if ("${{ github.event_name }}" -eq "workflow_dispatch") { "${{ inputs.tag }}" } else { "${{ github.ref_name }}" }
+          $version = $tag.TrimStart("v")
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          & .\installer\build.ps1 -Version $version -FfmpegDir $env:FFMPEG_DIR -Iscc $iscc -SkipBuild
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          "RELEASE_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Get-ChildItem dist -File | Select-Object Name, Length
 
-      - name: Upload build artifact
+      - name: Upload build artifacts
         uses: actions/upload-artifact@v5
         with:
           name: runvideo-windows-x86_64
           path: |
-            dist/runvideo.exe
-            dist/runvideo-windows-x86_64.zip
+            target/release/runvideo.exe
+            dist/RunVideo-*-setup.exe
+            dist/RunVideo-*-portable.zip
           if-no-files-found: error
 
       - name: Publish GitHub release
@@ -69,10 +86,19 @@ jobs:
           body: |
             Windows build of RunVideo.
 
-            **Requirements:** FFmpeg (`ffmpeg` and `ffprobe`) must be on your `PATH`.
+            **Installer (recommended):** `RunVideo-${{ env.RELEASE_VERSION }}-setup.exe`
+            installs RunVideo with everything it needs, including FFmpeg. No extra
+            downloads or configuration required.
 
-            Download `runvideo.exe` below, or the zip if you also want the README.
+            **Portable:** `RunVideo-${{ env.RELEASE_VERSION }}-portable.zip` unpacks
+            to a folder and runs from there; FFmpeg is included.
+
+            **Standalone `runvideo.exe`:** only the editor itself. It needs FFmpeg
+            and ffprobe either on your `PATH` or in a `ffmpeg\bin` folder next to
+            the executable. Use the installer or the portable zip if you don't
+            already have FFmpeg.
           files: |
-            dist/runvideo.exe
-            dist/runvideo-windows-x86_64.zip
+            dist/RunVideo-*-setup.exe
+            dist/RunVideo-*-portable.zip
+            target/release/runvideo.exe
           fail_on_unmatched_files: true

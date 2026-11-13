@@ -2,3 +2,6 @@
 build*.log
 *.rvproj
 *.mp4
+
+/dist
+/vendor
